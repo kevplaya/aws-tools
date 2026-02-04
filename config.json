@@ -1,0 +1,23 @@
+{
+  "thresholds": {
+    "cpu_low": 20,
+    "cpu_high": 80,
+    "network_high_mbps": 1000,
+    "memory_high": 85,
+    "disk_io_high_mbps": 500
+  },
+  "analysis_period_days": 7,
+  "recommendation_weights": {
+    "cost": 0.4,
+    "performance": 0.4,
+    "stability": 0.2
+  },
+  "instance_families": {
+    "general": ["t3", "t3a", "t2", "m5", "m5a", "m6i", "m6a"],
+    "compute": ["c5", "c5a", "c6i", "c6a"],
+    "memory": ["r5", "r5a", "r6i", "r6a"],
+    "storage": ["i3", "i3en", "d2", "h1"],
+    "accelerated": ["p3", "p4", "g4", "g5"]
+  },
+  "output_formats": ["console", "json", "csv"]
+}

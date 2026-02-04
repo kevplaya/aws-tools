@@ -1,0 +1,56 @@
+{
+  "thresholds": {
+    "cpu_low": 20,
+    "cpu_high": 80,
+    "memory_free_percent_low": 15,
+    "iops_utilization_high": 80,
+    "storage_free_percent_low": 20,
+    "connection_percent_high": 80,
+    "replica_lag_ms_high": 1000,
+    "read_write_ratio_high": 3.0
+  },
+  "analysis_period_days": 7,
+  "recommendation_weights": {
+    "cost": 0.4,
+    "performance": 0.4,
+    "stability": 0.2
+  },
+  "instance_families": {
+    "burstable": ["db.t3", "db.t4g"],
+    "memory_optimized": ["db.r5", "db.r6g", "db.r6i", "db.r7g"],
+    "general_purpose": ["db.m5", "db.m6g", "db.m6i", "db.m7g"]
+  },
+  "storage_types": {
+    "gp2": {
+      "min_iops": 100,
+      "max_iops": 16000,
+      "iops_per_gb": 3,
+      "cost_per_gb_month": 0.115
+    },
+    "gp3": {
+      "base_iops": 3000,
+      "max_iops": 16000,
+      "base_throughput_mbps": 125,
+      "max_throughput_mbps": 1000,
+      "cost_per_gb_month": 0.08
+    },
+    "io1": {
+      "min_iops": 1000,
+      "max_iops": 64000,
+      "cost_per_gb_month": 0.125,
+      "cost_per_iops_month": 0.065
+    },
+    "io2": {
+      "min_iops": 1000,
+      "max_iops": 256000,
+      "cost_per_gb_month": 0.125,
+      "cost_per_iops_month": 0.065
+    }
+  },
+  "aurora_specific": {
+    "replica_lag_warning_ms": 500,
+    "replica_lag_critical_ms": 1000,
+    "min_replicas_for_ha": 1,
+    "recommended_replicas_for_read_heavy": 2
+  }
+}
