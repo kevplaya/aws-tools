@@ -64,6 +64,8 @@ code { font-family: "SFMono-Regular", Consolas, monospace; font-size: .82rem; ov
 }
 .primary-button { color: #071b23; background: #58d5ed; box-shadow: 0 8px 20px rgb(35 177 204 / 20%); }
 .primary-button:hover { background: #76deef; }
+.cache-state { display: grid; gap: 4px; padding: 11px 12px; border: 1px solid #334763; border-radius: 9px; color: #dce6f4; background: rgb(255 255 255 / 5%); font-size: .78rem; }
+.cache-state span, .cache-state small { color: #9fb0c7; }
 .sidebar-note { margin: 0; color: #8294ad; font-size: .75rem; line-height: 1.5; }
 .muted { color: var(--muted); font-weight: 400; }
 
