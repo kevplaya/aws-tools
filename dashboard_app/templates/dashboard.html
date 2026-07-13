@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AWS 리소스·비용 점검</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22><text y=%22.9em%22 font-size=%2290%22>☁️</text></svg>">
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="{{ url_for('index') }}">
+      <span class="brand-mark">AWS</span>
+      <span>Architecture Review</span>
+    </a>
+    <p class="sidebar-copy">설정을 변경하지 않고 리소스, 비용, 운영 위험을 확인합니다.</p>
+
+    <form id="refresh-form" class="control-form" method="post" action="{{ url_for('refresh') }}">
+      <fieldset>
+        <legend>조회할 데이터</legend>
+        <label class="radio-row">
+          <input type="radio" name="mode" value="demo" {% if form.mode == 'demo' %}checked{% endif %}>
+          <span><strong>포트폴리오 예시</strong><small>AWS API를 호출하지 않음</small></span>
+        </label>
+        <label class="radio-row">
+          <input type="radio" name="mode" value="live" {% if form.mode == 'live' %}checked{% endif %}>
+          <span><strong>실제 AWS 계정</strong><small>읽기 전용 API로 조회</small></span>
+        </label>
+      </fieldset>
+
+      <label>조회할 리전
+        <input name="regions" value="{{ form.regions }}" placeholder="ap-northeast-2,us-east-1">
+      </label>
+      <label>AWS 프로필 이름 <span class="muted">(선택)</span>
+        <input name="profile" value="{{ form.profile }}" placeholder="my-readonly">
+      </label>
+      <label>진단 API 비용 상한($)
+        <input type="number" name="max_api_cost" min="0.01" max="10" step="0.01" value="{{ form.max_api_cost }}">
+        <small>조회 비용이 이 값을 넘기기 전에 중단합니다.</small>
+      </label>
+      <label class="check-row">
+        <input type="checkbox" name="deep_s3" {% if form.deep_s3 %}checked{% endif %}>
+        <span>S3 미완료 업로드 용량까지 상세 조회</span>
+      </label>
+      <button id="refresh-button" class="primary-button" type="submit">지금 조회</button>
+      <p class="sidebar-note">자격증명과 조회 결과는 파일로 저장하지 않습니다.</p>
+    </form>
+  </aside>
+
+  <main class="main-content">
+    <header class="page-header">
+      <div>
+        <p class="eyebrow">READ-ONLY AWS REVIEW</p>
+        <h1>AWS 리소스·비용·운영 상태 점검</h1>
+        <p>AWS에서 무엇을 확인했고, 왜 조치해야 하는지 바로 이해할 수 있도록 정리했습니다.</p>
+      </div>
+      <div class="snapshot-meta">
+        <span class="status-dot {% if data.mode == 'live' %}live{% endif %}"></span>
+        <strong>{{ data.mode_label }}</strong>
+        <small>{{ data.generated_at }}</small>
+      </div>
+    </header>
+
+    {% if notice %}
+      <div class="notice {{ notice[0] }}" role="status">{{ notice[1] }}</div>
+    {% endif %}
+    {% if data.mode == 'demo' %}
+      <div class="notice info">현재 화면은 사용법을 보여주기 위한 예시 데이터입니다. 실제 계정 결과가 아닙니다.</div>
+    {% else %}
+      <div class="notice success">AWS 계정 {{ data.account_id }}의 읽기 전용 조회 결과입니다.</div>
+    {% endif %}
+
+    <section class="metric-grid" aria-label="주요 지표">
+      <article class="metric-card"><span>발견한 리소스</span><strong>{{ data.metrics.resources|number }}개</strong></article>
+      <article class="metric-card">
+        <span>{{ data.metrics.cost_label }}</span><strong>{{ data.metrics.current_cost|money }}</strong>
+        {% if data.metrics.cost_delta is not none %}<small>전월 대비 {{ '%+.1f'|format(data.metrics.cost_delta) }}%</small>{% endif %}
+      </article>
+      <article class="metric-card accent"><span>예상 월 절감 가능액</span><strong>{{ data.metrics.monthly_savings|money }}</strong></article>
+      <article class="metric-card"><span>운영 이상 신호</span><strong>{{ data.metrics.problems|number }}건</strong></article>
+      <article class="metric-card"><span>이번 진단 API 비용</span><strong>{{ data.metrics.api_cost|money(4) }}</strong></article>
+    </section>
+
+    <details class="glossary">
+      <summary>처음 보는 용어 빠르게 이해하기</summary>
+      <div class="glossary-grid">
+        <p><strong>리소스</strong> EC2 서버, RDS DB, S3 버킷처럼 비용이 발생하거나 운영해야 하는 구성 요소입니다.</p>
+        <p><strong>Cost Optimization Hub</strong> 여러 AWS 서비스의 비용 절감 제안을 모아 중복을 줄이는 기능입니다.</p>
+        <p><strong>사양 조정</strong> 실제 사용량에 맞게 서버나 데이터베이스 크기를 바꾸는 작업입니다.</p>
+        <p><strong>ARN</strong> AWS 리소스를 유일하게 구분하는 전체 주소입니다.</p>
+        <p><strong>Lifecycle 규칙</strong> 오래된 S3 객체나 미완료 업로드를 자동 정리·이동하는 규칙입니다.</p>
+        <p><strong>API 비용 상한</strong> 진단 조회 비용이 설정값을 넘기기 전에 멈추는 안전장치입니다.</p>
+      </div>
+    </details>
+
+    <nav class="tabs" role="tablist" aria-label="점검 영역">
+      <button type="button" role="tab" aria-selected="true" aria-controls="overview" data-tab="overview">한눈에 보기</button>
+      <button type="button" role="tab" aria-selected="false" aria-controls="resources" data-tab="resources">리소스 찾기</button>
+      <button type="button" role="tab" aria-selected="false" aria-controls="costs" data-tab="costs">비용 분석</button>
+      <button type="button" role="tab" aria-selected="false" aria-controls="recommendations" data-tab="recommendations">절감 추천</button>
+      <button type="button" role="tab" aria-selected="false" aria-controls="problems" data-tab="problems">운영 문제</button>
+      <button type="button" role="tab" aria-selected="false" aria-controls="s3" data-tab="s3">S3 비용 검토</button>
+    </nav>
+
+    <section id="overview" class="tab-panel" role="tabpanel">
+      <p class="tab-intro">최근 비용 흐름, 서비스 구성, 가장 큰 절감 후보부터 확인합니다.</p>
+      <div class="split-grid wide-left">
+        <article class="card">
+          <div class="card-heading"><div><span>비용 추세</span><h2>월별 AWS 비용</h2></div><small>최근 6개월</small></div>
+          {% if data.monthly %}
+            <div class="bar-list">
+              {% for row in data.monthly %}
+                <div class="bar-row">
+                  <span>{{ row.month }}{% if row.estimated %} <em>추정</em>{% endif %}</span>
+                  <div class="bar-track"><i style="width: {{ row.bar_percent }}%"></i></div>
+                  <strong>{{ row.total_usd|money }}</strong>
+                </div>
+              {% endfor %}
+            </div>
+          {% else %}<p class="empty">비용 조회 기능이 꺼져 있거나 권한이 없습니다.</p>{% endif %}
+        </article>
+        <article class="card">
+          <div class="card-heading"><div><span>구성 현황</span><h2>서비스별 리소스 수</h2></div></div>
+          <div class="bar-list compact">
+            {% for row in data.resource_mix %}
+              <div class="bar-row"><span>{{ row.service }}</span><div class="bar-track purple"><i style="width: {{ row.bar_percent }}%"></i></div><strong>{{ row.count }}</strong></div>
+            {% else %}<p class="empty">발견한 리소스가 없습니다.</p>{% endfor %}
+          </div>
+        </article>
+      </div>
+
+      <article class="card table-card">
+        <div class="card-heading"><div><span>우선 검토</span><h2>예상 절감액이 큰 추천 5개</h2></div></div>
+        {% if data.top_recommendations %}
+          <div class="table-scroll"><table>
+            <thead><tr><th>권장 작업</th><th>대상 리소스</th><th>예상 월 절감액</th><th>목록 포함 이유</th></tr></thead>
+            <tbody>{% for row in data.top_recommendations %}<tr><td><strong>{{ row.action }}</strong></td><td><code>{{ row.resource_id }}</code></td><td class="money">{{ row.monthly_savings_usd|money(2) }}</td><td>{{ row.reason }}</td></tr>{% endfor %}</tbody>
+          </table></div>
+        {% else %}<p class="empty">AWS가 반환한 비용 절감 추천이 없습니다.</p>{% endif %}
+      </article>
+    </section>
+
+    <section id="resources" class="tab-panel" role="tabpanel" hidden>
+      <p class="tab-intro">여러 리전에 흩어진 서버·DB·버킷을 이름, 종류, 위치로 찾습니다.</p>
+      <article class="card table-card">
+        <div class="card-heading resource-heading">
+          <div><span>인벤토리</span><h2>리전 전체 리소스 목록</h2></div>
+          <form class="search-form" method="get" action="{{ url_for('index') }}#resources">
+            <input name="resource_query" value="{{ data.resource_query }}" placeholder="이름, 서비스, 종류, 리전" aria-label="리소스 검색">
+            <button type="submit">검색</button>
+          </form>
+        </div>
+        <p class="table-summary">검색 결과 {{ data.resource_match_total|number }}개{% if data.resource_truncated %} 중 앞의 500개만 표시합니다.{% endif %}</p>
+        <div class="table-scroll"><table>
+          <thead><tr><th>서비스</th><th>종류</th><th>이름</th><th>리전</th><th>현재 상태</th><th>조회 출처</th><th>리소스 고유 주소(ARN)</th></tr></thead>
+          <tbody>{% for row in data.resources %}<tr><td><span class="service-badge">{{ row.service }}</span></td><td>{{ row.type }}</td><td><strong>{{ row.name }}</strong></td><td>{{ row.region }}</td><td>{{ row.state }}</td><td>{{ row.source }}</td><td><code>{{ row.arn }}</code></td></tr>{% else %}<tr><td colspan="7" class="empty">검색 조건에 맞는 리소스가 없습니다.</td></tr>{% endfor %}</tbody>
+        </table></div>
+        <p class="footnote">Resource Explorer를 우선 사용하고, 사용할 수 없으면 EC2·RDS·Lambda API로 조회합니다.</p>
+      </article>
+    </section>
+
+    <section id="costs" class="tab-panel" role="tabpanel" hidden>
+      <p class="tab-intro">어떤 서비스에서 비용이 많이 발생했는지와 갑작스러운 비용 증가를 확인합니다.</p>
+      <div class="split-grid">
+        <article class="card table-card">
+          <div class="card-heading"><div><span>비용 구성</span><h2>서비스별 최근 6개월 비용</h2></div></div>
+          <div class="table-scroll"><table><thead><tr><th>서비스</th><th>비용</th></tr></thead><tbody>
+            {% for row in data.service_costs %}<tr><td>{{ row.service }}</td><td class="money">{{ row.cost_usd|money(2) }}</td></tr>{% else %}<tr><td colspan="2" class="empty">비용 데이터가 없습니다.</td></tr>{% endfor %}
+          </tbody></table></div>
+        </article>
+        <article class="card table-card">
+          <div class="card-heading"><div><span>비정상 증가</span><h2>최근 90일 비용 급증 신호</h2></div></div>
+          <div class="table-scroll"><table><thead><tr><th>기간</th><th>서비스</th><th>증가 비용</th><th>증가율</th></tr></thead><tbody>
+            {% for row in data.anomalies %}<tr><td>{{ row.start }} ~ {{ row.end }}</td><td>{{ row.service }}</td><td class="money">{{ row.impact_usd|money(2) }}</td><td>{{ row.percentage|number(1) }}%</td></tr>{% else %}<tr><td colspan="4" class="empty">비용 급증 신호가 없습니다.</td></tr>{% endfor %}
+          </tbody></table></div>
+        </article>
+      </div>
+      <div class="notice warning">이번 달 비용은 아직 확정되지 않은 추정치입니다. 장기 약정 구매 전에는 할인과 선결제 비용을 포함해 다시 검증하세요.</div>
+    </section>
+
+    <section id="recommendations" class="tab-panel" role="tabpanel" hidden>
+      <p class="tab-intro">AWS가 찾아낸 비용 절감 후보와 예상 효과, 실행 부담을 비교합니다. 추천은 자동 실행되지 않습니다.</p>
+      {% if data.mode == 'demo' %}<div class="notice warning">현재 2개 항목은 화면 설명용 예시입니다. 실제 계정의 판단 결과가 아닙니다.</div>{% endif %}
+      <details class="criteria" open>
+        <summary>어떤 기준으로 이 목록에 들어오나요?</summary>
+        <ol>
+          <li><strong>AWS 판단</strong> Cost Optimization Hub가 Compute Optimizer와 Cost Explorer 등의 추천을 모으고 겹치는 제안의 중복을 줄입니다.</li>
+          <li><strong>수집 기준</strong> 리전·리소스 종류·절감액 하한 없이 AWS가 반환한 추천을 모두 가져옵니다.</li>
+          <li><strong>표시 순서</strong> 예상 월 절감액이 큰 순서입니다. 별도의 자체 점수나 숨겨진 우선순위는 없습니다.</li>
+          <li><strong>절감액</strong> AWS가 계정 할인과 Savings Plans·예약 인스턴스 영향을 반영한 월간 추정치입니다.</li>
+          <li><strong>최종 판단</strong> 재시작, 되돌리기, 업무 영향과 성능을 확인한 뒤 적용해야 합니다.</li>
+        </ol>
+        <p><a href="https://docs.aws.amazon.com/cost-management/latest/userguide/cost-optimization-hub.html" target="_blank" rel="noreferrer">AWS 공식 설명</a> · <a href="https://docs.aws.amazon.com/cost-management/latest/userguide/coh-estimated-monthly-savings.html" target="_blank" rel="noreferrer">월 절감액 계산 방식</a></p>
+      </details>
+      <article class="card table-card">
+        <div class="card-heading"><div><span>절감 후보</span><h2>비용 절감 검토 목록</h2></div><small>{{ data.recommendations|length }}건</small></div>
+        <div class="table-scroll"><table>
+          <thead><tr><th>권장 작업</th><th>대상</th><th>리전</th><th>현재 월 비용</th><th>예상 월 절감액</th><th>절감률</th><th>난이도</th><th>재시작</th><th>되돌리기</th><th>판단 출처</th><th>포함 이유</th></tr></thead>
+          <tbody>{% for row in data.recommendations %}<tr><td><strong>{{ row.action }}</strong></td><td>{{ row.resource_type }}<br><code>{{ row.resource_id }}</code></td><td>{{ row.region }}</td><td>{{ row.monthly_cost_usd|money(2) }}</td><td class="money">{{ row.monthly_savings_usd|money(2) }}</td><td>{{ row.savings_percentage|number(1) }}%</td><td>{{ row.effort }}</td><td>{{ row.restart_needed }}</td><td>{{ row.rollback_possible }}</td><td>{{ row.source }}</td><td>{{ row.reason }}</td></tr>{% else %}<tr><td colspan="11" class="empty">추천이 없습니다. Cost Optimization Hub 등록·권한 또는 분석 완료 여부를 확인하세요.</td></tr>{% endfor %}</tbody>
+        </table></div>
+      </article>
+    </section>
+
+    <section id="problems" class="tab-panel" role="tabpanel" hidden>
+      <p class="tab-intro">현재 울리는 CloudWatch 경보와 EC2 상태 점검·예정 작업을 확인합니다.</p>
+      <article class="card">
+        <div class="card-heading"><div><span>운영 점검</span><h2>현재 운영 이상 신호</h2></div><small>{{ data.problems|length }}건</small></div>
+        <div class="finding-list">
+          {% for row in data.problems %}
+            <details><summary><span class="severity {{ row.severity }}">{{ row.severity_label }}</span>{{ row.title_label }}</summary><div><p><strong>AWS 상세 내용</strong><br>{{ row.detail }}</p><p><strong>확인할 리소스</strong><br><code>{{ row.resource }}</code></p><p><strong>다음 확인</strong><br>해당 리소스의 지표·로그와 예정 작업 시간을 확인하고 서비스 영향 여부를 판단합니다.</p></div></details>
+          {% else %}<div class="notice success">현재 ALARM 상태의 CloudWatch 경보와 EC2 상태 이상이 발견되지 않았습니다.</div>{% endfor %}
+        </div>
+      </article>
+    </section>
+
+    <section id="s3" class="tab-panel" role="tabpanel" hidden>
+      <p class="tab-intro">S3 비용이 어디서 발생하는지, 자동 정리 규칙이 빠졌는지, 저장 방식별 비용 차이를 확인합니다.</p>
+      <article class="card table-card">
+        <div class="card-heading"><div><span>버킷 현황</span><h2>S3 버킷별 비용 관련 상태</h2></div><small>{{ data.s3_buckets|length }}개</small></div>
+        <div class="table-scroll"><table><thead><tr><th>버킷</th><th>리전</th><th>용량(TB)</th><th>객체 수</th><th>버전 관리</th><th>자동 규칙</th><th>미완료 업로드</th><th>미완료 용량(GB)</th><th>접근 기록</th></tr></thead><tbody>
+          {% for row in data.s3_buckets %}<tr><td><strong>{{ row.name }}</strong></td><td>{{ row.region }}</td><td>{{ row.storage_tb|number(2) }}</td><td>{{ row.object_count|number }}</td><td>{{ row.versioning }}</td><td>{{ row.lifecycle_rules }}</td><td>{{ row.incomplete_count|number }}</td><td>{% if row.incomplete_gb is not none %}{{ row.incomplete_gb|number(2) }}{% else %}기본 조회에서는 미계산{% endif %}</td><td>{{ row.access_logging }}</td></tr>{% else %}<tr><td colspan="9" class="empty">조회한 S3 버킷이 없습니다.</td></tr>{% endfor %}
+        </tbody></table></div>
+      </article>
+
+      <div class="split-grid">
+        <article class="card table-card">
+          <div class="card-heading"><div><span>구성 점검</span><h2>확인이 필요한 S3 항목</h2></div></div>
+          <div class="table-scroll"><table><thead><tr><th>위험도</th><th>버킷</th><th>점검 항목</th><th>발견 이유</th><th>권장 조치</th></tr></thead><tbody>
+            {% for row in data.s3_findings %}<tr><td><span class="severity">{{ row.severity }}</span></td><td>{{ row.bucket }}</td><td><strong>{{ row.title }}</strong></td><td>{{ row.reason }}</td><td>{{ row.action }}</td></tr>{% else %}<tr><td colspan="5" class="empty">확인이 필요한 S3 항목이 없습니다.</td></tr>{% endfor %}
+          </tbody></table></div>
+        </article>
+        <article class="card table-card">
+          <div class="card-heading"><div><span>청구 원인</span><h2>S3 비용 발생 원인</h2></div></div>
+          <div class="table-scroll"><table><thead><tr><th>비용 성격</th><th>AWS 청구 코드</th><th>최근 6개월 비용</th></tr></thead><tbody>
+            {% for row in data.s3_costs %}<tr><td>{{ row.kind }}</td><td><code>{{ row.usage_type }}</code></td><td class="money">{{ row.cost_usd|money(2) }}</td></tr>{% else %}<tr><td colspan="3" class="empty">S3 비용 데이터가 없습니다.</td></tr>{% endfor %}
+          </tbody></table></div>
+        </article>
+      </div>
+
+      <article class="card tco-card">
+        <div class="card-heading"><div><span>비용 시뮬레이터</span><h2>S3 저장 방식별 월 비용 비교</h2></div><small>2026-06 서울 리전 예시 단가</small></div>
+        <p class="card-copy">저장 용량과 읽기 빈도를 바꿔 저장·인출·요청 비용 합계를 비교합니다. 변경 전 최신 AWS 가격을 다시 확인하세요.</p>
+        <form class="tco-form" method="get" action="{{ url_for('index') }}#s3">
+          <div class="input-grid">
+            <label>저장 용량(TB)<input type="number" name="storage_tb" min="0.1" max="10000" step="0.1" value="{{ data.tco_inputs.storage_tb }}"></label>
+            <label>객체 수(백만 개)<input type="number" name="object_millions" min="0.001" max="1000" step="0.001" value="{{ data.tco_inputs.object_millions }}"></label>
+            <label>월 전체 읽기 횟수<input type="number" name="reads" min="0" max="100" step="0.25" value="{{ data.tco_inputs.reads }}"><small>모든 객체와 바이트를 한 번 읽으면 1회</small></label>
+            <label>자동 계층화 저빈도 비율(%)<input type="number" name="cold_percent" min="0" max="100" step="1" value="{{ data.tco_inputs.cold_percent }}"></label>
+          </div>
+          <details class="pricing"><summary>계산에 사용한 단가 직접 수정</summary><div class="input-grid pricing-grid">
+            {% for row in data.pricing %}<label>{{ row.label }}<input type="number" name="{{ row.key }}" min="0" step="0.00001" value="{{ row.value }}"></label>{% endfor %}
+          </div></details>
+          <button class="secondary-button" type="submit">비용 다시 계산</button>
+        </form>
+        <div class="bar-list tco-bars">
+          {% for row in data.tco %}<div class="bar-row {% if row.best %}best{% endif %}"><span>{{ row.storage_class }}{% if row.best %} <em>최저</em>{% endif %}</span><div class="bar-track green"><i style="width: {{ row.bar_percent }}%"></i></div><strong>{{ row.monthly_usd|money(2) }}</strong></div>{% endfor %}
+        </div>
+      </article>
+    </section>
+
+    <details class="coverage">
+      <summary>이 대시보드가 확인하는 범위와 한계</summary>
+      <ul>
+        <li><strong>리소스</strong> Resource Explorer 우선, EC2·RDS·Lambda 직접 조회 보조</li>
+        <li><strong>비용</strong> Cost Explorer 월별 실제 사용 비용과 Cost Anomaly Detection 급증 신호</li>
+        <li><strong>절감 추천</strong> Cost Optimization Hub가 활성화된 경우의 AWS 추천</li>
+        <li><strong>운영 문제</strong> ALARM 상태 CloudWatch 경보와 EC2 인스턴스·시스템 상태</li>
+      </ul>
+      {% if data.errors %}<h3>조회하지 못한 항목</h3><div class="table-scroll"><table><thead><tr><th>영역</th><th>오류</th></tr></thead><tbody>{% for row in data.errors %}<tr><td>{{ row.section }}</td><td>{{ row.error }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
+    </details>
+
+    <footer>데이터: {{ data.mode_label }} · 조회 시각: {{ data.generated_at }}</footer>
+  </main>
+
+  <div id="loading" class="loading" hidden role="status" aria-live="polite"><span></span><strong>AWS 정보를 조회하는 중입니다.</strong><small>리소스 수에 따라 시간이 걸릴 수 있습니다.</small></div>
+  <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>
