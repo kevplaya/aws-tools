@@ -12,9 +12,20 @@ flowchart LR
     D["CloudWatch + EC2 상태"] --> F
     E["S3 API + 일별 지표"] --> F
     F --> G["정규화된 스냅샷"]
-    G --> H["Streamlit 대시보드"]
+    G --> H["Flask 로컬 대시보드"]
     G --> I["JSON 증거 자료"]
 ```
+
+## 대시보드 모듈 경계
+
+| 모듈 | 책임 |
+|---|---|
+| `dashboard.py` | 로컬 Flask 서버를 재로딩과 멀티스레드 없이 실행한다. |
+| `dashboard_app/__init__.py` | 화면 요청, 실제 AWS 조회, 입력값 검증과 마지막 정상 스냅샷을 관리한다. |
+| `dashboard_app/presentation.py` | AWS 원본 필드를 한국어 설명, 표, 비용 비교 데이터로 변환한다. |
+| `dashboard_app/templates`, `static` | HTML/CSS와 최소 JavaScript로 탭, 표, 그래프와 조회 진행 상태를 표시한다. |
+
+대시보드 실행 경로에서는 Streamlit, Pandas와 클라이언트 차트 라이브러리를 사용하지 않는다. 대량 리소스는 서버에서 검색하고 화면에는 한 번에 최대 500개만 표시한다.
 
 ## 2026년 기준으로 이 AWS 도구를 선택한 이유
 
