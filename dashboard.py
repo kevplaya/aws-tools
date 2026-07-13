@@ -8,7 +8,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from aws_audit import AwsAudit, DEFAULT_REGIONS, demo_report
+from aws_audit import AwsAudit, DEFAULT_REGIONS, S3_TCO_BASELINE, demo_report, s3_tco
 
 
 st.set_page_config(page_title="AWS Architecture Review", page_icon="☁️", layout="wide")
@@ -28,8 +28,8 @@ def latest_month_cost(report: dict) -> tuple[float, float | None]:
     return current, delta
 
 
-def load_live(regions: list[str], profile: str, max_api_cost: float) -> dict:
-    return AwsAudit(regions, profile or None, max_api_cost).collect()
+def load_live(regions: list[str], profile: str, max_api_cost: float, s3_depth: str) -> dict:
+    return AwsAudit(regions, profile or None, max_api_cost).collect(s3_depth)
 
 
 st.title("AWS Architecture & FinOps Review")
@@ -41,6 +41,7 @@ with st.sidebar:
     region_text = st.text_input("Regions", ",".join(DEFAULT_REGIONS))
     profile = st.text_input("AWS profile (optional)")
     max_api_cost = st.number_input("API cost guard (USD)", 0.01, 10.0, 1.0, 0.01)
+    deep_s3 = st.checkbox("Deep S3 MPU byte scan", help="Lists every uploaded part; cost guard remains active")
     refresh = st.button("Refresh snapshot", type="primary", use_container_width=True)
     st.caption("Live collection uses read-only APIs. Optional services fail independently.")
 
@@ -54,7 +55,9 @@ if refresh:
         regions = [item.strip() for item in region_text.split(",") if item.strip()]
         with st.spinner("Collecting read-only AWS evidence..."):
             try:
-                st.session_state.report = load_live(regions, profile, max_api_cost)
+                st.session_state.report = load_live(
+                    regions, profile, max_api_cost, "deep" if deep_s3 else "basic"
+                )
             except Exception as exc:  # Keep the last good dashboard snapshot visible.
                 st.error(str(exc))
 
@@ -133,7 +136,55 @@ with problems_tab:
         st.success("No active CloudWatch alarms or EC2 status findings were returned.")
 
 with s3_tab:
-    st.info("S3 storage-class TCO and incomplete multipart analysis are added in the next milestone.")
+    st.subheader("Bucket cost posture")
+    s3_buckets = report["s3"].get("buckets", [])
+    bucket_table = [
+        {
+            "bucket": row["name"],
+            "region": row["region"],
+            "storage_tb": row["total_storage_tb"],
+            "objects": row["object_count"],
+            "versioning": row["versioning"],
+            "lifecycle_rules": row["lifecycle_rules"],
+            "incomplete_mpu": row["incomplete_mpu_count"],
+            "incomplete_gb": row["incomplete_mpu_gb"],
+            "access_logging": row["access_logging"],
+        }
+        for row in s3_buckets
+    ]
+    st.dataframe(bucket_table, use_container_width=True, hide_index=True)
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("S3 findings")
+        st.dataframe(report["s3"].get("findings", []), use_container_width=True, hide_index=True)
+    with right:
+        st.subheader("S3 usage-type cost")
+        st.dataframe(report["s3"].get("costs", []), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Storage-class TCO simulator")
+    st.caption(
+        "Editable 2026-06 ap-northeast-2 baseline from the original S3 review. "
+        "Verify current AWS pricing before an implementation decision."
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    storage_tb = c1.number_input("Storage (TB)", 0.1, 10000.0, 26.0, 1.0)
+    object_millions = c2.number_input("Objects (million)", 0.001, 1000.0, 1.46, 0.1)
+    reads = c3.number_input("Full reads / month", 0.0, 100.0, 1.0, 0.25)
+    cold_fraction = c4.slider("I-T cold fraction", 0, 100, 0, 5) / 100
+    tco_rows = s3_tco(storage_tb, int(object_millions * 1_000_000), reads, cold_fraction)
+    st.bar_chart(pd.DataFrame(tco_rows), x="storage_class", y="monthly_usd", color="#2EB67D")
+    st.dataframe(tco_rows, use_container_width=True, hide_index=True)
+    with st.expander("Edit pricing assumptions"):
+        pricing = {
+            key: st.number_input(key, min_value=0.0, value=float(value), format="%.5f")
+            for key, value in S3_TCO_BASELINE.items()
+        }
+        adjusted = s3_tco(
+            storage_tb, int(object_millions * 1_000_000), reads, cold_fraction, pricing
+        )
+        st.dataframe(adjusted, use_container_width=True, hide_index=True)
 
 with st.expander("Collection coverage and limitations"):
     st.markdown(
