@@ -74,6 +74,6 @@ python -m py_compile aws_audit.py dashboard.py
 python aws_audit.py --demo --output /tmp/aws-tools-demo.json
 ```
 
-설계 근거는 [`docs/architecture.md`](docs/architecture.md), S3 분석 방법은 [`docs/s3-cost-review.md`](docs/s3-cost-review.md), 검증 가능한 작업 이력은 [`docs/portfolio-timeline.md`](docs/portfolio-timeline.md)를 참고하세요.
+설계 근거는 [`docs/architecture.md`](docs/architecture.md), S3 분석 방법은 [`docs/s3-cost-review.md`](docs/s3-cost-review.md)를 참고하세요.
 
 기존 `ec2_analyzer.py`, `rds_analyzer.py`는 상세 CloudWatch 통계 분석용으로 유지됩니다. 새 대시보드는 계정 전체의 우선순위를 찾고, 기존 분석기는 선택한 EC2/RDS를 깊게 확인하는 2단계 구조입니다.
