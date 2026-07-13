@@ -1,263 +1,79 @@
-# AWS Resource Analyzer
+# AWS Architecture & FinOps Review
 
-AWS CloudWatch 메트릭을 기반으로 EC2 및 RDS/Aurora 인스턴스를 분석하여 비용 최적화 추천을 제공하는 Python 도구입니다.
+Solutions Architect 포트폴리오를 위한 **읽기 전용 AWS 진단 대시보드**입니다. 여러 리전의 리소스, 비용 추세, AWS 추천, 운영 이상 신호와 S3 스토리지 비용을 한 화면에서 검토합니다.
 
-## Features
+![AWS Architecture and FinOps dashboard](output/playwright/dashboard-overview.png)
 
-✨ **EC2 인스턴스 분석**
-- CPU, 네트워크, 디스크 I/O 사용량 분석
-- 과다/부족 프로비저닝 감지
-- 인스턴스 타입 업/다운사이징 추천
+![S3 storage cost lab](output/playwright/s3-cost-lab.png)
 
-💾 **RDS/Aurora 데이터베이스 분석**
-- CPU, 메모리, IOPS, 지연시간 분석
-- 스토리지 타입 최적화 (gp2→gp3 전환으로 20% 절감)
-- Read Replica 필요성 분석
-- Aurora 클러스터 분석 및 Replica Lag 모니터링
+## What it answers
 
-📊 **리포팅**
-- 컬러풀한 콘솔 출력
-- JSON/CSV 형식 리포트 생성
-- 통계 분석 (평균, 최댓값, P95, P99)
+- 어떤 AWS 리소스가 어느 리전에 존재하는가?
+- 최근 6개월 비용은 어떻게 변했고 어떤 서비스가 지배적인가?
+- Cost Optimization Hub가 제안하는 월 절감액과 실행 난이도는 무엇인가?
+- 현재 ALARM 상태나 EC2 상태 이상이 있는가?
+- S3 비용이 저장, 인출, 요청 중 어디에서 발생하는가?
+- 미완료 멀티파트, noncurrent version, lifecycle 누락이 있는가?
+- Standard / Standard-IA / Glacier Instant Retrieval / Intelligent-Tiering 중 무엇이 유리한가?
 
-## Quick Start
-
-### 1. 설치
+## Dashboard
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+streamlit run dashboard.py
 ```
 
-### 2. AWS 인증 설정
+대시보드는 안전한 `Portfolio demo`로 시작합니다. `Live AWS`를 선택하고 **Refresh snapshot**을 눌러야만 AWS API를 호출합니다. 자격증명이나 실계정 결과는 저장소에 저장하지 않습니다.
+
+### JSON collector
 
 ```bash
-aws configure
+# AWS 호출 없는 데모 리포트
+python aws_audit.py --demo
+
+# 기본 읽기 전용 점검
+python aws_audit.py --profile my-readonly --region ap-northeast-2 --region us-east-1
+
+# 미완료 multipart의 모든 part 크기까지 계산
+python aws_audit.py --profile my-readonly --s3-depth deep --max-api-cost 1.00
 ```
 
-필요한 정보:
-- AWS Access Key ID
-- AWS Secret Access Key
-- Default region (예: ap-northeast-2)
+`--max-api-cost`는 Cost Explorer, CloudWatch, S3 LIST 호출의 보수적 상한입니다. 실제 청구서 계산기가 아니라, 깊은 스캔이 설정 금액을 넘기 전에 중단시키는 안전장치입니다.
 
-### 3. 실행
+## Coverage
 
-**EC2 분석:**
-```bash
-python ec2_analyzer.py analyze
-```
+| 목적 | 2026 AWS source | 구현 |
+|---|---|---|
+| 리소스 인벤토리 | AWS Resource Explorer | 전체 검색, EC2/RDS/Lambda fallback |
+| 비용 추세 | AWS Cost Explorer | 월별·서비스별 6개월 비용 |
+| 비용 이상 | AWS Cost Anomaly Detection | 최근 90일 anomaly |
+| 절감 백로그 | AWS Cost Optimization Hub | 절감액, 노력, restart/rollback |
+| 운영 문제 | CloudWatch + EC2 status | ALARM, instance/system check, scheduled event |
+| S3 용량 | S3 daily CloudWatch metrics | bucket·storage class·object count |
+| S3 구조 | S3 read-only APIs | versioning, lifecycle, logging, incomplete MPU |
+| S3 비용 | Cost Explorer usage type | 저장·인출·요청 비용 분해 |
+| S3 클래스 선택 | TCO simulator | 용량·객체 수·읽기 빈도·cold 비율 비교 |
 
-**RDS/Aurora 분석:**
-```bash
-python rds_analyzer.py analyze
-```
+Compute Optimizer는 Cost Optimization Hub가 수집하는 주요 추천 소스이므로 동일 추천을 별도 API로 중복 수집하지 않습니다. 조직 규모의 상세 원가 배부는 AWS Data Exports + QuickSight/CUDOS가 더 적합합니다.
 
-## Usage Examples
+## Safety
 
-### EC2 분석
+- 읽기 전용 IAM 정책: [`iam-policy.json`](iam-policy.json)
+- 쓰기·삭제·lifecycle 변경 API 없음
+- 객체 본문 `GetObject` 호출 없음; Glacier retrieval을 유발하지 않음
+- 선택 서비스가 미등록/권한 부족이어도 나머지 섹션은 계속 수집
+- 실계정 ID, ARN, bucket 이름은 데모 데이터에 포함하지 않음
 
-```bash
-# 모든 EC2 인스턴스 분석 (대화형)
-python ec2_analyzer.py analyze
-
-# 특정 인스턴스 분석
-python ec2_analyzer.py analyze --instance-id i-1234567890abcdef0
-
-# 30일 데이터로 분석 후 리포트 저장
-python ec2_analyzer.py analyze --days 30 --output-json ec2_report.json --output-csv ec2_report.csv
-
-# 특정 태그의 인스턴스만 분석
-python ec2_analyzer.py analyze --tag Environment=Production
-
-# 인스턴스 목록만 확인
-python ec2_analyzer.py list-instances-cmd
-```
-
-### RDS/Aurora 분석
+## Validation
 
 ```bash
-# 모든 RDS/Aurora 인스턴스 분석 (대화형)
-python rds_analyzer.py analyze
-
-# 특정 DB 인스턴스 분석
-python rds_analyzer.py analyze --db-identifier mydb-instance
-
-# Aurora 클러스터 전체 분석 (Writer + Readers)
-python rds_analyzer.py analyze --cluster my-aurora-cluster
-
-# 14일 데이터로 분석 후 리포트 저장
-python rds_analyzer.py analyze --days 14 --output-json rds_report.json
-
-# 클러스터 목록 확인
-python rds_analyzer.py list-clusters
+python -m unittest discover -s tests -v
+python -m py_compile aws_audit.py dashboard.py
+python aws_audit.py --demo --output /tmp/aws-tools-demo.json
 ```
 
-## Configuration
+설계 근거는 [`docs/architecture.md`](docs/architecture.md), S3 분석 방법은 [`docs/s3-cost-review.md`](docs/s3-cost-review.md), 검증 가능한 작업 이력은 [`docs/portfolio-timeline.md`](docs/portfolio-timeline.md)를 참고하세요.
 
-### EC2 설정 (`config.json`)
-
-```json
-{
-  "thresholds": {
-    "cpu_low": 20,          // CPU 낮음 임계값 (%)
-    "cpu_high": 80,         // CPU 높음 임계값 (%)
-    "network_high_mbps": 1000,
-    "memory_high": 85
-  },
-  "analysis_period_days": 7
-}
-```
-
-### RDS 설정 (`config_rds.json`)
-
-```json
-{
-  "thresholds": {
-    "cpu_low": 20,
-    "cpu_high": 80,
-    "memory_free_percent_low": 15,
-    "iops_utilization_high": 80,
-    "replica_lag_ms_high": 1000
-  },
-  "storage_types": {
-    "gp2": {"min_iops": 100, "max_iops": 16000},
-    "gp3": {"base_iops": 3000, "max_iops": 16000}
-  }
-}
-```
-
-## IAM Permissions
-
-AWS 계정에 다음 권한이 필요합니다:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:DescribeInstances",
-        "rds:DescribeDBInstances",
-        "rds:DescribeDBClusters",
-        "cloudwatch:GetMetricStatistics",
-        "cloudwatch:ListMetrics"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-```
-
-전체 IAM 정책은 `iam-policy.json` 파일을 참조하세요.
-
-**정책 적용 방법:**
-
-```bash
-# 정책 생성
-aws iam create-policy \
-  --policy-name AWSResourceAnalyzerPolicy \
-  --policy-document file://iam-policy.json
-
-# 사용자에 정책 연결
-aws iam attach-user-policy \
-  --user-name YOUR_USERNAME \
-  --policy-arn arn:aws:iam::ACCOUNT_ID:policy/AWSResourceAnalyzerPolicy
-```
-
-또는 AWS 관리형 정책 사용:
-```bash
-aws iam attach-user-policy \
-  --user-name YOUR_USERNAME \
-  --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
-```
-
-## Command Options
-
-### EC2 Analyzer
-
-| 옵션 | 설명 | 기본값 |
-|------|------|--------|
-| `--region` | AWS 리전 | AWS config 기본값 |
-| `--days` | 분석 기간 (일) | 7 |
-| `--output-json` | JSON 출력 파일 경로 | - |
-| `--output-csv` | CSV 출력 파일 경로 | - |
-| `--instance-id` | 특정 인스턴스 ID | - |
-| `--tag` | 태그 필터 (Key=Value) | - |
-
-### RDS Analyzer
-
-| 옵션 | 설명 | 기본값 |
-|------|------|--------|
-| `--region` | AWS 리전 | AWS config 기본값 |
-| `--days` | 분석 기간 (일) | 7 |
-| `--output-json` | JSON 출력 파일 경로 | - |
-| `--output-csv` | CSV 출력 파일 경로 | - |
-| `--db-identifier` | 특정 DB 인스턴스 ID | - |
-| `--cluster` | 특정 Aurora 클러스터 ID | - |
-| `--tag` | 태그 필터 (Key=Value) | - |
-
-## Output Examples
-
-### 콘솔 출력
-
-```
-================================================================================
-EC2 Instance Analysis Report
-================================================================================
-
-Instance Information:
-  Instance ID:    i-0abc123def456789
-  Name:           web-server-prod
-  Current Type:   t3.large
-  Analysis Period: Last 7 days
-
-Resource Utilization Metrics:
-┌─────────────────┬─────────┬─────────┬─────────┬─────────┐
-│ Metric          │ Average │ Maximum │ P95     │ P99     │
-├─────────────────┼─────────┼─────────┼─────────┼─────────┤
-│ CPU (%)         │ 23.45   │ 68.20   │ 45.10   │ 58.30   │
-│ Network In (MB) │ 125.30  │ 450.80  │ 380.20  │ 420.50  │
-└─────────────────┴─────────┴─────────┴─────────┴─────────┘
-
-Recommendation:
-  Action:         Downsize
-  Recommended:    t3.medium
-  Risk Level:     Low
-  Est. Savings:   ~50%
-
-  Reasons:
-    - CPU utilization is low (avg: 23.5%, P95: 45.1%)
-================================================================================
-```
-
-### JSON 출력
-
-```json
-{
-  "instance_id": "i-0abc123def456789",
-  "current_type": "t3.large",
-  "analysis": {
-    "cpu": {"average": 23.45, "p95": 45.10, "p99": 58.30}
-  },
-  "recommendation": {
-    "action": "Downsize",
-    "recommended_type": "t3.medium",
-    "risk_level": "Low",
-    "estimated_savings_percent": 50
-  }
-}
-```
-
-## Cost Savings Examples
-
-### EC2 최적화
-- **Downsize**: t3.xlarge → t3.large = ~50% 절감 (~$60/월)
-- **평균 절감률**: 30-50%
-
-### RDS 최적화
-- **gp2 → gp3**: 100GB 기준 ~20% 절감 ($3.50/월)
-- **Instance Downsize**: db.r5.xlarge → db.r5.large = ~50% 절감 (~$104/월)
-- **Provisioned IOPS 최적화**: io1 → gp3 = ~40% 절감 (사용률이 낮은 경우)
-
-**버전**: 1.0.0  
-**최종 업데이트**: 2026-02-04
+기존 `ec2_analyzer.py`, `rds_analyzer.py`는 상세 CloudWatch 통계 분석용으로 유지됩니다. 새 대시보드는 계정 전체의 우선순위를 찾고, 기존 분석기는 선택한 EC2/RDS를 깊게 확인하는 2단계 구조입니다.

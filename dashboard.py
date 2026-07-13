@@ -18,14 +18,15 @@ def money(value: float) -> str:
     return f"${value:,.0f}"
 
 
-def latest_month_cost(report: dict) -> tuple[float, float | None]:
+def latest_month_cost(report: dict) -> tuple[float, float | None, bool]:
     rows = report["costs"].get("monthly", [])
     if not rows:
-        return 0.0, None
+        return 0.0, None, False
     current = float(rows[-1]["total_usd"])
+    estimated = bool(rows[-1].get("estimated"))
     previous = float(rows[-2]["total_usd"]) if len(rows) > 1 else None
-    delta = None if not previous else ((current - previous) / previous) * 100
-    return current, delta
+    delta = None if estimated or not previous else ((current - previous) / previous) * 100
+    return current, delta, estimated
 
 
 def load_live(regions: list[str], profile: str, max_api_cost: float, s3_depth: str) -> dict:
@@ -42,7 +43,7 @@ with st.sidebar:
     profile = st.text_input("AWS profile (optional)")
     max_api_cost = st.number_input("API cost guard (USD)", 0.01, 10.0, 1.0, 0.01)
     deep_s3 = st.checkbox("Deep S3 MPU byte scan", help="Lists every uploaded part; cost guard remains active")
-    refresh = st.button("Refresh snapshot", type="primary", use_container_width=True)
+    refresh = st.button("Refresh snapshot", type="primary", width="stretch")
     st.caption("Live collection uses read-only APIs. Optional services fail independently.")
 
 if "report" not in st.session_state:
@@ -62,12 +63,16 @@ if refresh:
                 st.error(str(exc))
 
 report = st.session_state.report
-current_cost, cost_delta = latest_month_cost(report)
+current_cost, cost_delta, current_estimated = latest_month_cost(report)
 monthly_savings = sum(float(r.get("monthly_savings_usd", 0)) for r in report["recommendations"])
 
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Resources", len(report["resources"]))
-k2.metric("Latest cost", money(current_cost), None if cost_delta is None else f"{cost_delta:+.1f}%")
+k2.metric(
+    "Current MTD cost" if current_estimated else "Latest cost",
+    money(current_cost),
+    None if cost_delta is None else f"{cost_delta:+.1f}%",
+)
 k3.metric("Savings backlog", money(monthly_savings) + "/mo")
 k4.metric("Active findings", len(report["problems"]))
 k5.metric("API estimate", f"${report['api_cost_guard']['estimated_usd']:.4f}")
@@ -94,7 +99,7 @@ with overview:
             st.bar_chart(summary, x="service", y="count", horizontal=True, color="#7C5CFC")
 
     st.subheader("Top savings opportunities")
-    st.dataframe(report["recommendations"][:5], use_container_width=True, hide_index=True)
+    st.dataframe(report["recommendations"][:5], width="stretch", hide_index=True)
 
 with resources_tab:
     st.subheader("Cross-region resource inventory")
@@ -103,7 +108,7 @@ with resources_tab:
     if search:
         needle = search.casefold()
         resource_rows = [row for row in resource_rows if needle in " ".join(map(str, row.values())).casefold()]
-    st.dataframe(resource_rows, use_container_width=True, hide_index=True)
+    st.dataframe(resource_rows, width="stretch", hide_index=True)
     st.caption("Resource Explorer is preferred; EC2, RDS, and Lambda APIs are the fallback.")
 
 with costs_tab:
@@ -111,16 +116,16 @@ with costs_tab:
     with left:
         st.subheader("Service cost (six-month total)")
         service_rows = report["costs"].get("services", [])
-        st.dataframe(service_rows, use_container_width=True, hide_index=True)
+        st.dataframe(service_rows, width="stretch", hide_index=True)
     with right:
         st.subheader("Cost anomalies (90 days)")
         anomalies = report["costs"].get("anomalies", [])
-        st.dataframe(anomalies, use_container_width=True, hide_index=True)
+        st.dataframe(anomalies, width="stretch", hide_index=True)
     st.warning("The current month is estimated and can be incomplete. Validate commitments with amortized cost views.")
 
 with recommendations_tab:
     st.subheader("Cost Optimization Hub backlog")
-    st.dataframe(report["recommendations"], use_container_width=True, hide_index=True)
+    st.dataframe(report["recommendations"], width="stretch", hide_index=True)
     st.caption(
         "AWS-generated estimates account for account-specific pricing terms when Cost Optimization Hub is enabled."
     )
@@ -152,15 +157,15 @@ with s3_tab:
         }
         for row in s3_buckets
     ]
-    st.dataframe(bucket_table, use_container_width=True, hide_index=True)
+    st.dataframe(bucket_table, width="stretch", hide_index=True)
 
     left, right = st.columns(2)
     with left:
         st.subheader("S3 findings")
-        st.dataframe(report["s3"].get("findings", []), use_container_width=True, hide_index=True)
+        st.dataframe(report["s3"].get("findings", []), width="stretch", hide_index=True)
     with right:
         st.subheader("S3 usage-type cost")
-        st.dataframe(report["s3"].get("costs", []), use_container_width=True, hide_index=True)
+        st.dataframe(report["s3"].get("costs", []), width="stretch", hide_index=True)
 
     st.divider()
     st.subheader("Storage-class TCO simulator")
@@ -175,7 +180,7 @@ with s3_tab:
     cold_fraction = c4.slider("I-T cold fraction", 0, 100, 0, 5) / 100
     tco_rows = s3_tco(storage_tb, int(object_millions * 1_000_000), reads, cold_fraction)
     st.bar_chart(pd.DataFrame(tco_rows), x="storage_class", y="monthly_usd", color="#2EB67D")
-    st.dataframe(tco_rows, use_container_width=True, hide_index=True)
+    st.dataframe(tco_rows, width="stretch", hide_index=True)
     with st.expander("Edit pricing assumptions"):
         pricing = {
             key: st.number_input(key, min_value=0.0, value=float(value), format="%.5f")
@@ -184,7 +189,7 @@ with s3_tab:
         adjusted = s3_tco(
             storage_tb, int(object_millions * 1_000_000), reads, cold_fraction, pricing
         )
-        st.dataframe(adjusted, use_container_width=True, hide_index=True)
+        st.dataframe(adjusted, width="stretch", hide_index=True)
 
 with st.expander("Collection coverage and limitations"):
     st.markdown(
@@ -197,7 +202,7 @@ with st.expander("Collection coverage and limitations"):
         """
     )
     if report["errors"]:
-        st.dataframe(report["errors"], use_container_width=True, hide_index=True)
+        st.dataframe(report["errors"], width="stretch", hide_index=True)
 
 st.caption(
     f"Mode: {report['mode']} · Generated: {datetime.fromisoformat(report['generated_at']).astimezone():%Y-%m-%d %H:%M:%S %Z}"

@@ -1,47 +1,63 @@
 {
-  "Version": "2025-05-11",
+  "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "EC2AnalyzerPermissions",
+      "Sid": "IdentityAndResourceInventory",
       "Effect": "Allow",
       "Action": [
+        "sts:GetCallerIdentity",
+        "resource-explorer-2:ListViews",
+        "resource-explorer-2:GetDefaultView",
+        "resource-explorer-2:ListResources",
+        "resource-explorer-2:Search",
         "ec2:DescribeInstances",
-        "ec2:DescribeInstanceTypes",
         "ec2:DescribeInstanceStatus",
-        "ec2:DescribeTags"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "RDSAnalyzerPermissions",
-      "Effect": "Allow",
-      "Action": [
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeTags",
         "rds:DescribeDBInstances",
         "rds:DescribeDBClusters",
         "rds:DescribeDBClusterSnapshots",
         "rds:DescribeDBSnapshots",
         "rds:ListTagsForResource",
-        "rds:DescribeDBClusterParameters",
-        "rds:DescribeDBParameters"
+        "lambda:ListFunctions"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "CloudWatchMetricsPermissions",
-      "Effect": "Allow",
-      "Action": [
-        "cloudwatch:GetMetricStatistics",
-        "cloudwatch:ListMetrics",
-        "cloudwatch:GetMetricData"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "OptionalCostExplorerPermissions",
+      "Sid": "CostAndOptimization",
       "Effect": "Allow",
       "Action": [
         "ce:GetCostAndUsage",
-        "ce:GetCostForecast"
+        "ce:GetCostForecast",
+        "ce:GetAnomalies",
+        "cost-optimization-hub:ListRecommendations",
+        "cost-optimization-hub:GetRecommendation",
+        "cost-optimization-hub:ListRecommendationSummaries"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:GetMetricData",
+        "cloudwatch:ListMetrics"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3CostPostureReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListAllMyBuckets",
+        "s3:GetBucketLocation",
+        "s3:GetBucketVersioning",
+        "s3:GetBucketLogging",
+        "s3:GetLifecycleConfiguration",
+        "s3:ListBucketMultipartUploads",
+        "s3:ListMultipartUploadParts"
       ],
       "Resource": "*"
     }
