@@ -19,6 +19,10 @@ ENV/
 reports/
 *.json
 *.csv
+*.db
+*.db-shm
+*.db-wal
+data/
 !config.json
 !config_rds.json
 !iam-policy.json

@@ -1,12 +1,22 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from aws_audit import demo_report
 from dashboard_app import create_app
+from dashboard_app.storage import SnapshotStore
 
 
 class DashboardTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = TemporaryDirectory()
+        self.database_path = Path(self.temporary_directory.name) / "dashboard.db"
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
     def test_dashboard_explains_tabs_and_recommendation_criteria(self):
-        response = create_app().test_client().get("/")
+        response = create_app(database_path=self.database_path).test_client().get("/")
         body = response.get_data(as_text=True)
 
         self.assertEqual(response.status_code, 200)
@@ -16,7 +26,7 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("streamlit", body.casefold())
 
     def test_demo_refresh_keeps_dashboard_available(self):
-        response = create_app().test_client().post(
+        response = create_app(database_path=self.database_path).test_client().post(
             "/refresh", data={"mode": "demo"}, follow_redirects=True
         )
 
@@ -40,7 +50,8 @@ class DashboardTests(unittest.TestCase):
 
             return Collector()
 
-        response = create_app(factory).test_client().post(
+        app = create_app(factory, database_path=self.database_path)
+        response = app.test_client().post(
             "/refresh",
             data={
                 "mode": "live",
@@ -55,6 +66,46 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(calls, [(["ap-northeast-2", "us-east-1"], "readonly", 0.25)])
         self.assertIn("AWS 계정 123456789012", response.get_data(as_text=True))
+        self.assertEqual(app.test_client().get("/health").get_json()["snapshot_count"], 1)
+
+    def test_restart_loads_latest_live_snapshot_without_aws_call(self):
+        def factory(regions, profile, max_api_cost):
+            class Collector:
+                @staticmethod
+                def collect(depth):
+                    report = demo_report()
+                    report["mode"] = "live"
+                    report["identity"]["account_id"] = "123456789012"
+                    return report
+
+            return Collector()
+
+        create_app(factory, database_path=self.database_path).test_client().post(
+            "/refresh", data={"mode": "live"}
+        )
+
+        def fail_if_called(*args):
+            raise AssertionError("startup must not call AWS")
+
+        restarted = create_app(fail_if_called, database_path=self.database_path)
+        body = restarted.test_client().get("/").get_data(as_text=True)
+
+        self.assertIn("AWS 계정 123456789012", body)
+        self.assertIn("현재 화면: DB #1", body)
+        self.assertEqual(restarted.test_client().get("/health").get_json()["mode"], "live")
+
+    def test_snapshot_store_keeps_complete_report(self):
+        report = demo_report()
+        report["mode"] = "live"
+        report["custom_evidence"] = {"checked": True}
+        store = SnapshotStore(self.database_path)
+
+        metadata = store.save(report)
+        loaded, loaded_metadata = store.latest()
+
+        self.assertEqual(metadata.id, 1)
+        self.assertEqual(loaded["custom_evidence"], {"checked": True})
+        self.assertEqual(loaded_metadata.resource_count, len(report["resources"]))
 
 
 if __name__ == "__main__":

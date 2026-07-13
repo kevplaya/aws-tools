@@ -43,7 +43,12 @@
         <span>S3 미완료 업로드 용량까지 상세 조회</span>
       </label>
       <button id="refresh-button" class="primary-button" type="submit">지금 조회</button>
-      <p class="sidebar-note">자격증명과 조회 결과는 파일로 저장하지 않습니다.</p>
+      <div class="cache-state">
+        <strong>로컬 DB 캐시</strong>
+        <span>저장된 실계정 스냅샷 {{ cache.snapshot_count }}개</span>
+        {% if cache.current %}<small>현재 화면: DB #{{ cache.current.id }}</small>{% else %}<small>현재 화면: 예시 데이터</small>{% endif %}
+      </div>
+      <p class="sidebar-note">AWS 자격증명은 저장하지 않습니다. 조회 결과만 컨테이너의 SQLite 볼륨에 보관합니다.</p>
     </form>
   </aside>
 
@@ -67,7 +72,7 @@
     {% if data.mode == 'demo' %}
       <div class="notice info">현재 화면은 사용법을 보여주기 위한 예시 데이터입니다. 실제 계정 결과가 아닙니다.</div>
     {% else %}
-      <div class="notice success">AWS 계정 {{ data.account_id }}의 읽기 전용 조회 결과입니다.</div>
+      <div class="notice success">AWS 계정 {{ data.account_id }}의 읽기 전용 조회 결과입니다.{% if cache.current %} 재시작 시 DB 스냅샷 #{{ cache.current.id }}을 다시 사용합니다.{% endif %}</div>
     {% endif %}
 
     <section class="metric-grid" aria-label="주요 지표">

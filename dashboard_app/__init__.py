@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import logging
+import os
+from pathlib import Path
+from time import monotonic
 from typing import Any, Callable
 
-from flask import Flask, redirect, render_template, request, url_for
+from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 from aws_audit import AwsAudit, DEFAULT_REGIONS, S3_TCO_BASELINE, demo_report
 from dashboard_app.presentation import build_dashboard, format_money, format_number
+from dashboard_app.storage import SnapshotStore
+
+
+LOGGER = logging.getLogger("aws_tools.dashboard")
 
 
 DEFAULT_FORM = {
@@ -47,19 +55,38 @@ def _tco_inputs(args: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
-def create_app(collector_factory: Callable[..., AwsAudit] = AwsAudit) -> Flask:
+def create_app(
+    collector_factory: Callable[..., AwsAudit] = AwsAudit,
+    database_path: str | Path | None = None,
+) -> Flask:
     app = Flask(__name__)
-    # ponytail: process memory is enough for this single-user local tool; add persistence if hosted.
+    store = SnapshotStore(database_path or os.getenv("AWS_DASHBOARD_DB", "data/aws-tools.db"))
+    cached_report, cached_metadata = store.latest()
+    initial_report = cached_report or demo_report()
+    initial_form = dict(DEFAULT_FORM)
+    if cached_report:
+        initial_form["mode"] = "live"
+        LOGGER.info(
+            "cached snapshot loaded id=%s resources=%s generated_at=%s",
+            cached_metadata.id,
+            cached_metadata.resource_count,
+            cached_metadata.generated_at,
+        )
+    else:
+        LOGGER.info("no live snapshot in database; starting with demo data")
     app.config.update(
-        DASHBOARD_REPORT=demo_report(),
-        DASHBOARD_FORM=dict(DEFAULT_FORM),
+        DASHBOARD_REPORT=initial_report,
+        DASHBOARD_FORM=initial_form,
         DASHBOARD_NOTICE=None,
+        DASHBOARD_STORE=store,
+        DASHBOARD_SNAPSHOT=cached_metadata,
     )
     app.jinja_env.filters["money"] = format_money
     app.jinja_env.filters["number"] = format_number
 
     @app.get("/")
     def index():
+        snapshot = app.config["DASHBOARD_SNAPSHOT"]
         return render_template(
             "dashboard.html",
             data=build_dashboard(
@@ -69,6 +96,20 @@ def create_app(collector_factory: Callable[..., AwsAudit] = AwsAudit) -> Flask:
             ),
             form=app.config["DASHBOARD_FORM"],
             notice=app.config.pop("DASHBOARD_NOTICE", None),
+            cache={
+                "snapshot_count": store.count(),
+                "current": snapshot.as_dict() if snapshot else None,
+            },
+        )
+
+    @app.get("/health")
+    def health():
+        snapshot = app.config["DASHBOARD_SNAPSHOT"]
+        return jsonify(
+            status="ok",
+            mode=app.config["DASHBOARD_REPORT"].get("mode", "demo"),
+            snapshot_count=store.count(),
+            current_snapshot_id=snapshot.id if snapshot else None,
         )
 
     @app.post("/refresh")
@@ -91,17 +132,46 @@ def create_app(collector_factory: Callable[..., AwsAudit] = AwsAudit) -> Flask:
 
         if mode == "demo":
             app.config["DASHBOARD_REPORT"] = demo_report()
+            app.config["DASHBOARD_SNAPSHOT"] = None
             app.config["DASHBOARD_NOTICE"] = ("success", "예시 데이터를 새로 불러왔습니다.")
+            LOGGER.info("demo report loaded; AWS APIs were not called")
         else:
+            started_at = monotonic()
+            LOGGER.info(
+                "live refresh started regions=%s profile=%s s3_depth=%s max_api_cost=%.2f",
+                ",".join(regions),
+                profile or "default",
+                "deep" if deep_s3 else "basic",
+                max_api_cost,
+            )
             try:
                 report = collector_factory(regions, profile or None, max_api_cost).collect(
                     "deep" if deep_s3 else "basic"
                 )
+                metadata = store.save(report)
             except Exception as exc:  # Keep the last good snapshot visible.
-                app.config["DASHBOARD_NOTICE"] = ("error", f"AWS 조회에 실패했습니다: {exc}")
+                app.config["DASHBOARD_NOTICE"] = (
+                    "error",
+                    f"AWS 조회 또는 DB 저장에 실패했습니다: {exc}",
+                )
+                LOGGER.exception("live refresh failed after %.2fs", monotonic() - started_at)
             else:
                 app.config["DASHBOARD_REPORT"] = report
-                app.config["DASHBOARD_NOTICE"] = ("success", "AWS 읽기 전용 조회를 완료했습니다.")
+                app.config["DASHBOARD_SNAPSHOT"] = metadata
+                app.config["DASHBOARD_NOTICE"] = (
+                    "success",
+                    f"AWS 읽기 전용 조회를 완료하고 DB 스냅샷 #{metadata.id}로 저장했습니다.",
+                )
+                LOGGER.info(
+                    "live refresh saved id=%s duration=%.2fs resources=%s recommendations=%s "
+                    "problems=%s estimated_api_cost=%.4f",
+                    metadata.id,
+                    monotonic() - started_at,
+                    metadata.resource_count,
+                    metadata.recommendation_count,
+                    metadata.problem_count,
+                    float(report.get("api_cost_guard", {}).get("estimated_usd", 0)),
+                )
 
         return redirect(url_for("index") + "#overview")
 

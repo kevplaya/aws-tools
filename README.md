@@ -16,18 +16,53 @@ Solutions Architect 포트폴리오를 위한 **읽기 전용 AWS 진단 대시�
 - 미완료 멀티파트, noncurrent version, lifecycle 누락이 있는가?
 - Standard / Standard-IA / Glacier Instant Retrieval / Intelligent-Tiering 중 무엇이 유리한가?
 
-## 대시보드 실행
+## Docker로 대시보드 실행
+
+```bash
+docker compose up --build -d
+docker compose ps
+```
+
+브라우저에서 `http://127.0.0.1:8501`을 여세요. 처음 실행해 DB가 비어 있으면 `포트폴리오 예시`를 보여줍니다. `실제 AWS 계정`을 선택하고 **지금 조회**를 눌러야 AWS API를 호출하며, 정상 조회 결과는 SQLite에 저장됩니다. 이후 컨테이너를 재시작해도 마지막 실계정 스냅샷을 DB에서 읽으므로 AWS를 다시 조회하지 않습니다.
+
+로컬 AWS 설정과 SSO 캐시는 컨테이너의 `/root/.aws`에 읽기 전용으로 연결됩니다. 이름 있는 프로필을 기본값으로 쓰려면 다음처럼 실행합니다.
+
+```bash
+AWS_PROFILE=my-readonly docker compose up --build -d
+```
+
+화면의 `AWS 프로필 이름`에 입력해도 됩니다. 액세스 키를 DB에 저장하지 않으며, 실계정 조회 결과만 이름 있는 Docker 볼륨 `aws-tools_aws-dashboard-data`의 `/data/aws-tools.db`에 보관합니다.
+
+### 컨테이너 로그와 DB 확인
+
+```bash
+# 요청, AWS 조회 시작·성공·실패, DB 스냅샷 저장 로그
+docker compose logs -f dashboard
+
+# 저장된 스냅샷 요약 확인
+docker compose exec dashboard python -c "import sqlite3; db=sqlite3.connect('/data/aws-tools.db'); print(db.execute('select id, generated_at, resource_count, recommendation_count, problem_count from snapshots order by id desc').fetchall())"
+
+# 컨테이너만 중지·삭제 — DB 볼륨은 유지
+docker compose down
+
+# DB까지 완전히 삭제할 때만 사용
+docker compose down -v
+```
+
+로그는 최대 10MB 파일 3개로 순환합니다. 대시보드는 로컬 PC에서만 열리도록 `127.0.0.1:8501`에 바인딩되어 있습니다.
+
+### Docker 없이 개발 실행
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dashboard.txt
 python dashboard.py
 ```
 
-브라우저에서 `http://127.0.0.1:8501`을 여세요. 대시보드는 안전한 `포트폴리오 예시`로 시작합니다. `실제 AWS 계정`을 선택하고 **지금 조회**를 눌러야 AWS API를 호출합니다. 자격증명이나 실계정 결과는 저장소에 저장하지 않습니다.
+이 경우 SQLite 기본 경로는 `data/aws-tools.db`입니다. `AWS_DASHBOARD_DB` 환경 변수로 바꿀 수 있습니다.
 
-화면은 Flask, HTML/CSS와 최소 JavaScript로 동작합니다. 대시보드 실행 경로에서는 Streamlit, Pandas, 별도 차트 라이브러리를 사용하지 않습니다.
+화면은 Flask, Gunicorn, HTML/CSS와 최소 JavaScript로 동작합니다. 대시보드 실행 경로에서는 Streamlit, Pandas, 별도 차트 라이브러리를 사용하지 않습니다. 컨테이너는 AWS 조회 중에도 상태 확인에 응답하도록 단일 worker·2개 thread와 300초 요청 제한을 사용합니다.
 
 ### JSON 수집기
 
@@ -72,8 +107,9 @@ Compute Optimizer는 Cost Optimization Hub가 수집하는 주요 추천 소스�
 
 ```bash
 python -m unittest discover -s tests -v
-python -m py_compile aws_audit.py dashboard.py dashboard_app/__init__.py dashboard_app/presentation.py
+python -m py_compile aws_audit.py dashboard.py dashboard_app/__init__.py dashboard_app/presentation.py dashboard_app/storage.py
 python aws_audit.py --demo --output /tmp/aws-tools-demo.json
+docker compose config
 ```
 
 설계 근거는 [`docs/architecture.md`](docs/architecture.md), S3 분석 방법은 [`docs/s3-cost-review.md`](docs/s3-cost-review.md)를 참고하세요.
