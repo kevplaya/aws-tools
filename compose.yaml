@@ -1,0 +1,41 @@
+name: aws-tools
+
+services:
+  dashboard:
+    build:
+      context: .
+    image: aws-tools-dashboard:local
+    ports:
+      - "127.0.0.1:8501:8501"
+    environment:
+      - DASHBOARD_HOST=0.0.0.0
+      - DASHBOARD_PORT=8501
+      - AWS_DASHBOARD_DB=/data/aws-tools.db
+      - PYTHONUNBUFFERED=1
+      - AWS_PROFILE
+      - AWS_DEFAULT_REGION
+      - AWS_REGION
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+    volumes:
+      - aws-dashboard-data:/data
+      - ${HOME}/.aws:/root/.aws:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  aws-dashboard-data:
