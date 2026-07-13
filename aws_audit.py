@@ -28,6 +28,33 @@ except ModuleNotFoundError:  # Demo mode and pure tests do not need the AWS SDK.
 
 DEFAULT_REGIONS = ("ap-northeast-2", "us-east-1")
 
+S3_STORAGE_TYPES = {
+    "StandardStorage": "STANDARD",
+    "StandardIAStorage": "STANDARD_IA",
+    "OneZoneIAStorage": "ONEZONE_IA",
+    "GlacierStorage": "GLACIER",
+    "GlacierInstantRetrievalStorage": "GLACIER_IR",
+    "DeepArchiveStorage": "DEEP_ARCHIVE",
+    "IntelligentTieringFAStorage": "INTELLIGENT_TIERING",
+    "IntelligentTieringIAStorage": "INTELLIGENT_TIERING",
+    "IntelligentTieringAAStorage": "INTELLIGENT_TIERING",
+    "IntelligentTieringAIAStorage": "INTELLIGENT_TIERING",
+    "IntelligentTieringDAAStorage": "INTELLIGENT_TIERING",
+}
+
+S3_TCO_BASELINE = {
+    "standard_storage": 0.025,
+    "ia_storage": 0.0138,
+    "gir_storage": 0.005,
+    "standard_retrieval": 0.0,
+    "ia_retrieval": 0.01,
+    "gir_retrieval": 0.03,
+    "standard_get_per_1000": 0.0004,
+    "ia_get_per_1000": 0.001,
+    "gir_get_per_1000": 0.01,
+    "it_monitor_per_1000": 0.0025,
+}
+
 
 def _json_default(value: Any) -> Any:
     if isinstance(value, (datetime, Decimal)):
@@ -69,6 +96,93 @@ def normalize_cost_results(results: Iterable[dict[str, Any]]) -> dict[str, list[
             for service, cost in services.most_common()
         ],
     }
+
+
+def s3_tco(
+    storage_tb: float,
+    object_count: int,
+    full_reads_per_month: float,
+    intelligent_tiering_cold_fraction: float = 0.0,
+    rates: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Compare S3 classes using an explicit, editable monthly TCO model.
+
+    A "full read" means every byte and object is read once. Intelligent-Tiering
+    uses the IA rate for the caller-supplied cold fraction and has no retrieval
+    charge; actual automatic-tier distribution must be verified with metrics.
+    """
+    price = {**S3_TCO_BASELINE, **(rates or {})}
+    gb = storage_tb * 1024
+    requests_1000 = object_count / 1000
+    cold = min(max(intelligent_tiering_cold_fraction, 0.0), 1.0)
+
+    def total(storage_rate: float, retrieval_rate: float, request_rate: float) -> float:
+        return (
+            gb * storage_rate
+            + full_reads_per_month * gb * retrieval_rate
+            + full_reads_per_month * requests_1000 * request_rate
+        )
+
+    it_storage = gb * (
+        (1 - cold) * price["standard_storage"] + cold * price["ia_storage"]
+    )
+    it_total = (
+        it_storage
+        + requests_1000 * price["it_monitor_per_1000"]
+        + full_reads_per_month * requests_1000 * price["standard_get_per_1000"]
+    )
+    rows = [
+        {"storage_class": "STANDARD", "monthly_usd": total(price["standard_storage"], 0, price["standard_get_per_1000"])},
+        {"storage_class": "STANDARD_IA", "monthly_usd": total(price["ia_storage"], price["ia_retrieval"], price["ia_get_per_1000"])},
+        {"storage_class": "GLACIER_IR", "monthly_usd": total(price["gir_storage"], price["gir_retrieval"], price["gir_get_per_1000"])},
+        {"storage_class": "INTELLIGENT_TIERING", "monthly_usd": it_total},
+    ]
+    for row in rows:
+        row["monthly_usd"] = round(row["monthly_usd"], 2)
+    return sorted(rows, key=lambda row: row["monthly_usd"])
+
+
+def s3_findings(buckets: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for bucket in buckets:
+        name = bucket["name"]
+        if bucket.get("incomplete_mpu_count", 0):
+            size = bucket.get("incomplete_mpu_gb")
+            detail = f"{bucket['incomplete_mpu_count']:,} incomplete uploads"
+            if size is not None:
+                detail += f" / {size:,.2f} GB billed until completed or aborted"
+            findings.append(
+                {"severity": "high", "bucket": name, "check": "incomplete_multipart", "detail": detail}
+            )
+        if not bucket.get("has_abort_mpu_rule"):
+            findings.append(
+                {
+                    "severity": "medium",
+                    "bucket": name,
+                    "check": "abort_lifecycle",
+                    "detail": "No lifecycle rule aborts incomplete multipart uploads",
+                }
+            )
+        if bucket.get("versioning") == "Enabled" and not bucket.get("has_noncurrent_expiration"):
+            findings.append(
+                {
+                    "severity": "medium",
+                    "bucket": name,
+                    "check": "noncurrent_versions",
+                    "detail": "Versioning is enabled without noncurrent-version expiration",
+                }
+            )
+        if not bucket.get("access_logging"):
+            findings.append(
+                {
+                    "severity": "info",
+                    "bucket": name,
+                    "check": "access_evidence",
+                    "detail": "Server access logging is off; historical object reads cannot be reconstructed",
+                }
+            )
+    order = {"high": 0, "medium": 1, "info": 2}
+    return sorted(findings, key=lambda row: (order[row["severity"]], row["bucket"]))
 
 
 @dataclass
@@ -344,6 +458,156 @@ class AwsAudit:
             params["nextToken"] = token
         return sorted(rows, key=lambda row: row["monthly_savings_usd"], reverse=True)
 
+    def s3(self, depth: str = "basic") -> dict[str, list[dict[str, Any]]]:
+        buckets = self.capture("s3-buckets", lambda: self._s3_buckets(depth), [])
+        return {
+            "buckets": buckets,
+            "findings": s3_findings(buckets),
+            "costs": self.capture("s3-costs", self._s3_costs, []),
+            "depth": depth,
+        }
+
+    def _s3_buckets(self, depth: str) -> list[dict[str, Any]]:
+        global_client = self.client("s3", self.regions[0])
+        rows: list[dict[str, Any]] = []
+        for entry in global_client.list_buckets().get("Buckets", []):
+            name = entry["Name"]
+            location = global_client.get_bucket_location(Bucket=name).get("LocationConstraint")
+            region = "us-east-1" if location in (None, "") else ("eu-west-1" if location == "EU" else location)
+            client = self.client("s3", region)
+            versioning = client.get_bucket_versioning(Bucket=name).get("Status", "Disabled")
+            logging = bool(client.get_bucket_logging(Bucket=name).get("LoggingEnabled"))
+            lifecycle = self.capture(
+                f"s3-lifecycle:{name}",
+                lambda client=client, name=name: client.get_bucket_lifecycle_configuration(Bucket=name).get("Rules", []),
+                [],
+            )
+            uploads, upload_bytes = self._multipart_uploads(client, name, depth == "deep")
+            rows.append(
+                {
+                    "name": name,
+                    "region": region,
+                    "created_at": entry.get("CreationDate"),
+                    "versioning": versioning,
+                    "access_logging": logging,
+                    "lifecycle_rules": len(lifecycle),
+                    "has_abort_mpu_rule": any(r.get("AbortIncompleteMultipartUpload") for r in lifecycle),
+                    "has_noncurrent_expiration": any(r.get("NoncurrentVersionExpiration") for r in lifecycle),
+                    "transition_rules": sum(bool(r.get("Transitions")) for r in lifecycle),
+                    "incomplete_mpu_count": len(uploads),
+                    "incomplete_mpu_gb": None if upload_bytes is None else round(upload_bytes / 1024**3, 2),
+                    "object_count": 0,
+                    "total_storage_tb": 0.0,
+                    "storage_classes": {},
+                }
+            )
+        self._add_s3_cloudwatch_metrics(rows)
+        return sorted(rows, key=lambda row: row["total_storage_tb"], reverse=True)
+
+    def _multipart_uploads(self, client, bucket: str, deep: bool) -> tuple[list[dict[str, Any]], int | None]:
+        uploads: list[dict[str, Any]] = []
+        paginator = client.get_paginator("list_multipart_uploads")
+        for page in paginator.paginate(Bucket=bucket):
+            self.budget.reserve("s3_list")
+            uploads.extend(page.get("Uploads", []))
+        if not deep:
+            return uploads, None
+
+        size = 0
+        for upload in uploads:
+            parts = client.get_paginator("list_parts")
+            for page in parts.paginate(Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"]):
+                self.budget.reserve("s3_list")
+                size += sum(int(part.get("Size", 0)) for part in page.get("Parts", []))
+        return uploads, size
+
+    def _add_s3_cloudwatch_metrics(self, buckets: list[dict[str, Any]]) -> None:
+        for region in sorted({row["region"] for row in buckets}):
+            region_rows = [row for row in buckets if row["region"] == region]
+            queries: list[dict[str, Any]] = []
+            query_map: dict[str, tuple[dict[str, Any], str]] = {}
+            index = 0
+            for row in region_rows:
+                for storage_type, storage_class in S3_STORAGE_TYPES.items():
+                    query_id = f"m{index}"
+                    index += 1
+                    queries.append(self._s3_metric_query(query_id, row["name"], "BucketSizeBytes", storage_type))
+                    query_map[query_id] = (row, storage_class)
+                query_id = f"m{index}"
+                index += 1
+                queries.append(self._s3_metric_query(query_id, row["name"], "NumberOfObjects", "AllStorageTypes"))
+                query_map[query_id] = (row, "OBJECTS")
+
+            client = self.client("cloudwatch", region)
+            for offset in range(0, len(queries), 500):
+                batch = queries[offset : offset + 500]
+                self.budget.reserve("cloudwatch", len(batch))
+                response = self.capture(
+                    f"s3-cloudwatch:{region}",
+                    lambda batch=batch: client.get_metric_data(
+                        MetricDataQueries=batch,
+                        StartTime=datetime.now(timezone.utc) - timedelta(days=3),
+                        EndTime=datetime.now(timezone.utc),
+                        ScanBy="TimestampDescending",
+                    ),
+                    {"MetricDataResults": []},
+                )
+                for result in response.get("MetricDataResults", []):
+                    values = result.get("Values", [])
+                    if not values:
+                        continue
+                    row, metric = query_map[result["Id"]]
+                    value = float(values[0])
+                    if metric == "OBJECTS":
+                        row["object_count"] = int(value)
+                    elif value:
+                        gb = value / 1024**3
+                        row["storage_classes"][metric] = round(
+                            row["storage_classes"].get(metric, 0.0) + gb, 2
+                        )
+            for row in region_rows:
+                row["total_storage_tb"] = round(sum(row["storage_classes"].values()) / 1024, 2)
+
+    @staticmethod
+    def _s3_metric_query(query_id: str, bucket: str, metric: str, storage_type: str) -> dict[str, Any]:
+        return {
+            "Id": query_id,
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/S3",
+                    "MetricName": metric,
+                    "Dimensions": [
+                        {"Name": "BucketName", "Value": bucket},
+                        {"Name": "StorageType", "Value": storage_type},
+                    ],
+                },
+                "Period": 86400,
+                "Stat": "Average",
+            },
+            "ReturnData": True,
+        }
+
+    def _s3_costs(self) -> list[dict[str, Any]]:
+        client = self.client("ce", "us-east-1")
+        today = datetime.now(timezone.utc).date()
+        self.budget.reserve("cost_explorer")
+        response = client.get_cost_and_usage(
+            TimePeriod={"Start": _month_start(today, -5).isoformat(), "End": (today + timedelta(days=1)).isoformat()},
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost", "UsageQuantity"],
+            Filter={"Dimensions": {"Key": "SERVICE", "Values": ["Amazon Simple Storage Service"]}},
+            GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+        )
+        totals: Counter[str] = Counter()
+        for result in response.get("ResultsByTime", []):
+            for group in result.get("Groups", []):
+                totals[group["Keys"][0]] += float(group["Metrics"]["UnblendedCost"]["Amount"])
+        return [
+            {"usage_type": key, "cost_usd": round(value, 2)}
+            for key, value in totals.most_common()
+            if value > 0.01
+        ]
+
     def _alarm_findings(self, region: str) -> list[dict[str, Any]]:
         client = self.client("cloudwatch", region)
         rows = []
@@ -398,7 +662,7 @@ class AwsAudit:
                     )
         return rows
 
-    def collect(self) -> dict[str, Any]:
+    def collect(self, s3_depth: str = "basic") -> dict[str, Any]:
         resources = self.resources()
         costs = self.costs()
         report = {
@@ -411,7 +675,7 @@ class AwsAudit:
             "costs": costs,
             "recommendations": self.recommendations(),
             "problems": self.problems(),
-            "s3": {"buckets": [], "findings": [], "costs": []},
+            "s3": self.s3(s3_depth),
             "api_cost_guard": {
                 "estimated_usd": round(self.budget.spent_usd, 4),
                 "limit_usd": self.budget.max_usd,
@@ -450,6 +714,46 @@ def demo_report() -> dict[str, Any]:
             "region": "ap-northeast-2",
             "state": "active",
             "source": "demo",
+        },
+    ]
+    s3_buckets = [
+        {
+            "name": "weather-data-demo",
+            "region": "ap-northeast-2",
+            "created_at": "2021-06-01T00:00:00+00:00",
+            "versioning": "Enabled",
+            "access_logging": False,
+            "lifecycle_rules": 6,
+            "has_abort_mpu_rule": False,
+            "has_noncurrent_expiration": False,
+            "transition_rules": 6,
+            "incomplete_mpu_count": 1001,
+            "incomplete_mpu_gb": 103.07,
+            "object_count": 12_100_000,
+            "total_storage_tb": 342.6,
+            "storage_classes": {
+                "GLACIER_IR": 228556.8,
+                "STANDARD": 34611.2,
+                "DEEP_ARCHIVE": 86323.2,
+                "GLACIER": 1341.4,
+                "STANDARD_IA": 51.2,
+            },
+        },
+        {
+            "name": "data-lake-dev-demo",
+            "region": "ap-northeast-2",
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "versioning": "Disabled",
+            "access_logging": False,
+            "lifecycle_rules": 2,
+            "has_abort_mpu_rule": True,
+            "has_noncurrent_expiration": False,
+            "transition_rules": 0,
+            "incomplete_mpu_count": 836,
+            "incomplete_mpu_gb": 638.86,
+            "object_count": 820_000,
+            "total_storage_tb": 21.0,
+            "storage_classes": {"STANDARD": 21504.0},
         },
     ]
     return {
@@ -522,7 +826,17 @@ def demo_report() -> dict[str, Any]:
                 "resource": "i-demo1",
             }
         ],
-        "s3": {"buckets": [], "findings": [], "costs": []},
+        "s3": {
+            "buckets": s3_buckets,
+            "findings": s3_findings(s3_buckets),
+            "costs": [
+                {"usage_type": "TimedStorage-GIR-ByteHrs", "cost_usd": 6090.0},
+                {"usage_type": "Retrieval-GIR", "cost_usd": 1534.72},
+                {"usage_type": "Requests-GIR", "cost_usd": 220.05},
+                {"usage_type": "Retrieval-SIA", "cost_usd": 67.74},
+            ],
+            "depth": "deep",
+        },
         "api_cost_guard": {"estimated_usd": 0.0, "limit_usd": 1.0},
         "errors": [],
     }
@@ -535,13 +849,14 @@ def main() -> None:
     parser.add_argument("--profile", help="AWS profile name")
     parser.add_argument("--max-api-cost", default=1.0, type=float)
     parser.add_argument("--demo", action="store_true", help="Use safe sample data without AWS calls")
+    parser.add_argument("--s3-depth", choices=("basic", "deep"), default="basic")
     parser.add_argument("--output", default="reports/latest.json")
     args = parser.parse_args()
 
     report = (
         demo_report()
         if args.demo
-        else AwsAudit(args.regions or DEFAULT_REGIONS, args.profile, args.max_api_cost).collect()
+        else AwsAudit(args.regions or DEFAULT_REGIONS, args.profile, args.max_api_cost).collect(args.s3_depth)
     )
     path = Path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)
