@@ -1,79 +1,79 @@
-# S3 cost review playbook
+# S3 비용 검토 플레이북
 
-This playbook turns the June 2026 read-only S3 investigation into a repeatable, sanitized portfolio workflow.
+이 문서는 2026년 6월에 수행한 읽기 전용 S3 조사를 반복 가능한 포트폴리오 분석 절차로 정리한 것이다. 실계정 식별 정보는 포함하지 않는다.
 
-## 1. Separate the bill before recommending a class
+## 1. 스토리지 클래스를 추천하기 전에 청구 항목을 분리한다
 
-Use Cost Explorer grouped by `USAGE_TYPE` and distinguish:
+Cost Explorer 결과를 `USAGE_TYPE`으로 묶고 다음 항목을 구분한다.
 
-1. storage byte-hours by class;
-2. retrieval bytes;
-3. GET/LIST requests;
-4. data transfer;
-5. early-delete or restore charges.
+1. 스토리지 클래스별 저장 바이트 시간
+2. 인출 데이터 용량
+3. GET/LIST 요청
+4. 외부 데이터 전송
+5. 최소 보관 기간 위반 또는 복원 비용
 
-A low storage price alone is not a recommendation. Glacier Instant Retrieval can lose to Standard when a data set is repeatedly scanned because every retrieved GB and request is charged.
+저장 단가가 낮다는 이유만으로 스토리지 클래스를 추천하면 안 된다. Glacier Instant Retrieval은 읽은 용량과 요청마다 비용이 발생하므로 데이터셋 전체를 반복해서 읽으면 Standard보다 비싸질 수 있다.
 
-## 2. Inventory storage posture
+## 2. 버킷별 저장 상태를 확인한다
 
-For each bucket collect:
+각 버킷에서 다음 항목을 수집한다.
 
-- region and creation time;
-- daily `BucketSizeBytes` by storage class;
-- daily `NumberOfObjects`;
-- versioning status;
-- lifecycle transitions;
-- incomplete multipart abort rule;
-- noncurrent-version expiration;
-- server access logging;
-- incomplete multipart upload count and, in deep mode, uploaded part bytes.
+- 리전과 생성 시각
+- 스토리지 클래스별 일별 `BucketSizeBytes`
+- 일별 `NumberOfObjects`
+- 버저닝 상태
+- 라이프사이클 전환 규칙
+- 미완료 멀티파트 업로드 중단 규칙
+- 이전 버전 만료 규칙
+- 서버 액세스 로깅
+- 미완료 멀티파트 업로드 수와 상세 모드의 업로드 파트 용량
 
-S3 Storage Lens is the native organization-scale alternative and adds historical and prefix-level metrics. The local scanner is useful when the account has not enabled advanced Storage Lens or when a portable portfolio demo is needed.
+S3 Storage Lens는 조직 규모 분석을 위한 AWS 기본 기능으로, 과거 추세와 접두사별 지표를 추가로 제공한다. 고급 Storage Lens를 사용하지 않는 계정이나 이식 가능한 포트폴리오 시연에는 로컬 스캐너를 사용한다.
 
-## 3. TCO model
+## 3. 총비용 모델
 
-For a data set of `G` GB, `N` objects and `R` full reads per month:
+데이터셋 용량을 `G` GB, 객체 수를 `N`, 한 달 전체 읽기 횟수를 `R`이라고 하면 다음과 같이 계산한다.
 
 ```text
-monthly = G × storage_rate
-        + R × G × retrieval_rate
-        + R × (N / 1000) × GET_rate
-        + monitoring_fee
+월비용 = G × 저장단가
+       + R × G × 인출단가
+       + R × (N / 1000) × GET단가
+       + 모니터링비용
 ```
 
-The simulator includes the 2026-06 `ap-northeast-2` assumptions used during the original review. They are intentionally editable because AWS prices and account discounts change.
+시뮬레이터의 기본값은 기존 검토에서 사용한 2026년 6월 `ap-northeast-2` 기준이다. AWS 요금과 계정별 할인 조건은 바뀔 수 있으므로 모든 단가를 직접 수정할 수 있다.
 
-The original sanitized case was 26 TB, about 1.46 million objects, average object size about 18 MB:
+식별 정보를 제거한 기존 사례는 26TB, 약 146만 개 객체, 평균 객체 크기 약 18MB였다.
 
-- GIR was economical only below roughly 0.65 full reads/month;
-- at one or more monthly reads, retrieval materially erased storage savings;
-- Intelligent-Tiering monitoring was small because the files were large and object count per TB was low;
-- a mixed hot/cold archive favored Intelligent-Tiering, while uniformly hot data favored Standard.
+- GIR은 한 달 전체 읽기가 약 0.65회 미만일 때만 경제적이었다.
+- 한 달에 한 번 이상 전체를 읽으면 인출 비용이 저장비 절감 효과를 크게 줄였다.
+- 파일이 크고 TB당 객체 수가 적어서 Intelligent-Tiering 모니터링 비용은 작았다.
+- 핫 데이터와 콜드 데이터가 섞여 있으면 Intelligent-Tiering, 전체가 계속 사용되면 Standard가 적합했다.
 
-## 4. High-signal findings
+## 4. 우선 확인할 항목
 
-### Incomplete multipart uploads
+### 미완료 멀티파트 업로드
 
-Uploaded parts are billed until completion or abort. Basic mode counts uploads. Deep mode calls `ListParts` for exact stranded bytes but never downloads objects.
+업로드된 파트는 완료하거나 중단할 때까지 저장 비용이 청구된다. 기본 모드는 업로드 수만 확인한다. 상세 모드는 `ListParts`로 실제 점유 용량을 계산하지만 객체 본문은 내려받지 않는다.
 
-The safe recommendation is a lifecycle rule such as abort after seven days. The dashboard reports the gap but deliberately does not apply it.
+일반적인 안전 조치는 시작 후 7일이 지난 미완료 업로드를 중단하는 라이프사이클 규칙이다. 대시보드는 설정 누락을 알려주지만 규칙을 직접 적용하지 않는다.
 
-### Noncurrent versions
+### 이전 객체 버전
 
-Versioning without `NoncurrentVersionExpiration` can hide large retained versions from current-object listings. Measure with Storage Lens or S3 Inventory before choosing retention.
+버저닝을 사용하면서 `NoncurrentVersionExpiration`이 없으면 현재 객체 목록에 나타나지 않는 이전 버전이 계속 쌓일 수 있다. 보관 기간을 결정하기 전에 Storage Lens 또는 S3 Inventory로 실제 용량을 측정한다.
 
-### Access evidence
+### 접근 증거
 
-When server access logging and CloudTrail data events were not enabled, historical GET activity cannot be reconstructed. Athena/Glue history can be a useful proxy, not proof that no other client reads the objects.
+서버 액세스 로깅과 CloudTrail 데이터 이벤트가 꺼져 있었다면 과거 GET 기록을 나중에 복원할 수 없다. Athena/Glue 실행 기록은 접근 패턴을 추정하는 보조 자료일 뿐, 다른 클라이언트가 객체를 읽지 않았다는 증거는 아니다.
 
-## 5. Decision rules
+## 5. 선택 기준
 
-| Access pattern | First candidate | Verify before action |
+| 접근 패턴 | 우선 검토 대상 | 적용 전 확인 사항 |
 |---|---|---|
-| Continuously hot | Standard | P95 access interval and request volume |
-| Mixed/unknown, large objects | Intelligent-Tiering | Cold fraction and monitoring fee |
-| Rare, immediate retrieval required | Glacier Instant Retrieval | Retrieval break-even and minimum duration |
-| Truly cold, hours acceptable | Deep Archive | Restore RTO and minimum duration |
-| Disposable generated data | Expiration | Owner, retention policy, legal/audit needs |
+| 지속적으로 자주 읽음 | Standard | P95 접근 간격과 요청량 |
+| 접근 패턴이 섞여 있거나 불확실하고 객체가 큼 | Intelligent-Tiering | 콜드 데이터 비율과 모니터링 비용 |
+| 거의 읽지 않지만 즉시 인출이 필요함 | Glacier Instant Retrieval | 인출 손익분기점과 최소 보관 기간 |
+| 실제 콜드 데이터이며 수 시간 복원 시간이 허용됨 | Deep Archive | 복구 목표 시간과 최소 보관 기간 |
+| 다시 만들 수 있는 일회성 생성 데이터 | 만료 규칙 | 소유자, 보관 정책, 법적·감사 요구사항 |
 
-No class transition or deletion should be automated from a single snapshot.
+한 번의 스냅샷만으로 스토리지 클래스 전환이나 객체 삭제를 자동 실행하면 안 된다.
