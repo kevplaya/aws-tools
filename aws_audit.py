@@ -13,7 +13,7 @@ import json
 import argparse
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -38,6 +38,37 @@ def _json_default(value: Any) -> Any:
 def resource_summary(resources: Iterable[dict[str, Any]]) -> dict[str, int]:
     """Count resources by service for dashboard KPIs."""
     return dict(sorted(Counter(r.get("service", "unknown") for r in resources).items()))
+
+
+def _month_start(value: date, offset: int = 0) -> date:
+    month_index = value.year * 12 + value.month - 1 + offset
+    return date(month_index // 12, month_index % 12 + 1, 1)
+
+
+def normalize_cost_results(results: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Convert grouped Cost Explorer results into chart-friendly rows."""
+    monthly: list[dict[str, Any]] = []
+    services: Counter[str] = Counter()
+    for result in results:
+        month_total = 0.0
+        for group in result.get("Groups", []):
+            amount = float(group["Metrics"]["UnblendedCost"]["Amount"])
+            month_total += amount
+            services[group["Keys"][0]] += amount
+        monthly.append(
+            {
+                "month": result["TimePeriod"]["Start"][:7],
+                "total_usd": round(month_total, 2),
+                "estimated": bool(result.get("Estimated")),
+            }
+        )
+    return {
+        "monthly": monthly,
+        "services": [
+            {"service": service, "cost_usd": round(cost, 2)}
+            for service, cost in services.most_common()
+        ],
+    }
 
 
 @dataclass
@@ -227,6 +258,92 @@ class AwsAudit:
             )
         return sorted(findings, key=lambda f: (f["severity"], f["service"], f["title"]))
 
+    def costs(self) -> dict[str, list[dict[str, Any]]]:
+        return self.capture(
+            "cost-explorer",
+            self._costs,
+            {"monthly": [], "services": [], "anomalies": []},
+        )
+
+    def _costs(self) -> dict[str, list[dict[str, Any]]]:
+        client = self.client("ce", "us-east-1")
+        today = datetime.now(timezone.utc).date()
+        start = _month_start(today, -5)
+        end = today + timedelta(days=1)
+        self.budget.reserve("cost_explorer")
+        response = client.get_cost_and_usage(
+            TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+            GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+        )
+        results = list(response.get("ResultsByTime", []))
+        while response.get("NextPageToken"):
+            self.budget.reserve("cost_explorer")
+            response = client.get_cost_and_usage(
+                TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+                Granularity="MONTHLY",
+                Metrics=["UnblendedCost"],
+                GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+                NextPageToken=response["NextPageToken"],
+            )
+            results.extend(response.get("ResultsByTime", []))
+
+        normalized = normalize_cost_results(results)
+        normalized["anomalies"] = self.capture("cost-anomalies", self._cost_anomalies, [])
+        return normalized
+
+    def _cost_anomalies(self) -> list[dict[str, Any]]:
+        today = datetime.now(timezone.utc).date()
+        client = self.client("ce", "us-east-1")
+        self.budget.reserve("cost_explorer")
+        response = client.get_anomalies(
+            DateInterval={"StartDate": (today - timedelta(days=90)).isoformat(), "EndDate": today.isoformat()},
+            MaxResults=100,
+        )
+        return [
+            {
+                "start": item["AnomalyStartDate"],
+                "end": item.get("AnomalyEndDate"),
+                "service": (item.get("DimensionValue") or "unknown"),
+                "impact_usd": round(float(item.get("Impact", {}).get("TotalImpact", 0)), 2),
+                "percentage": round(float(item.get("Impact", {}).get("TotalImpactPercentage", 0)), 1),
+                "root_causes": item.get("RootCauses", []),
+            }
+            for item in response.get("Anomalies", [])
+        ]
+
+    def recommendations(self) -> list[dict[str, Any]]:
+        return self.capture("cost-optimization-hub", self._recommendations, [])
+
+    def _recommendations(self) -> list[dict[str, Any]]:
+        client = self.client("cost-optimization-hub", "us-east-1")
+        params: dict[str, Any] = {"maxResults": 100}
+        rows: list[dict[str, Any]] = []
+        while True:
+            response = client.list_recommendations(**params)
+            for item in response.get("items", []):
+                rows.append(
+                    {
+                        "action": item.get("actionType", "Review"),
+                        "resource_type": item.get("resourceType", "unknown"),
+                        "resource_id": item.get("resourceId") or item.get("resourceArn", "unknown"),
+                        "region": item.get("region", "global"),
+                        "monthly_cost_usd": round(float(item.get("estimatedMonthlyCost", 0)), 2),
+                        "monthly_savings_usd": round(float(item.get("estimatedMonthlySavings", 0)), 2),
+                        "savings_percentage": round(float(item.get("estimatedSavingsPercentage", 0)), 1),
+                        "effort": item.get("implementationEffort", "unknown"),
+                        "restart_needed": item.get("restartNeeded", False),
+                        "rollback_possible": item.get("rollbackPossible", False),
+                        "source": item.get("source", "Cost Optimization Hub"),
+                    }
+                )
+            token = response.get("nextToken")
+            if not token:
+                break
+            params["nextToken"] = token
+        return sorted(rows, key=lambda row: row["monthly_savings_usd"], reverse=True)
+
     def _alarm_findings(self, region: str) -> list[dict[str, Any]]:
         client = self.client("cloudwatch", region)
         rows = []
@@ -283,6 +400,7 @@ class AwsAudit:
 
     def collect(self) -> dict[str, Any]:
         resources = self.resources()
+        costs = self.costs()
         report = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "mode": "live",
@@ -290,8 +408,8 @@ class AwsAudit:
             "identity": self.identity(),
             "resources": resources,
             "resource_summary": resource_summary(resources),
-            "costs": {"monthly": [], "services": []},
-            "recommendations": [],
+            "costs": costs,
+            "recommendations": self.recommendations(),
             "problems": self.problems(),
             "s3": {"buckets": [], "findings": [], "costs": []},
             "api_cost_guard": {
@@ -341,8 +459,59 @@ def demo_report() -> dict[str, Any]:
         "identity": {"account_id": "000000000000", "arn": "demo", "principal_id": "demo"},
         "resources": resources,
         "resource_summary": resource_summary(resources),
-        "costs": {"monthly": [], "services": []},
-        "recommendations": [],
+        "costs": {
+            "monthly": [
+                {"month": "2026-02", "total_usd": 1840.0, "estimated": False},
+                {"month": "2026-03", "total_usd": 1975.0, "estimated": False},
+                {"month": "2026-04", "total_usd": 2050.0, "estimated": False},
+                {"month": "2026-05", "total_usd": 2215.0, "estimated": False},
+                {"month": "2026-06", "total_usd": 2090.0, "estimated": False},
+                {"month": "2026-07", "total_usd": 1010.0, "estimated": True},
+            ],
+            "services": [
+                {"service": "Amazon Simple Storage Service", "cost_usd": 4820.0},
+                {"service": "Amazon Relational Database Service", "cost_usd": 2580.0},
+                {"service": "Amazon Elastic Compute Cloud", "cost_usd": 1780.0},
+            ],
+            "anomalies": [
+                {
+                    "start": "2026-06-15",
+                    "end": "2026-06-17",
+                    "service": "Amazon Simple Storage Service",
+                    "impact_usd": 124.0,
+                    "percentage": 18.4,
+                    "root_causes": [],
+                }
+            ],
+        },
+        "recommendations": [
+            {
+                "action": "Rightsize",
+                "resource_type": "Ec2Instance",
+                "resource_id": "i-demo1",
+                "region": "ap-northeast-2",
+                "monthly_cost_usd": 122.0,
+                "monthly_savings_usd": 48.0,
+                "savings_percentage": 39.3,
+                "effort": "Low",
+                "restart_needed": True,
+                "rollback_possible": True,
+                "source": "Cost Optimization Hub",
+            },
+            {
+                "action": "Delete",
+                "resource_type": "EbsVolume",
+                "resource_id": "vol-unused-demo",
+                "region": "ap-northeast-2",
+                "monthly_cost_usd": 22.0,
+                "monthly_savings_usd": 22.0,
+                "savings_percentage": 100.0,
+                "effort": "VeryLow",
+                "restart_needed": False,
+                "rollback_possible": False,
+                "source": "Cost Optimization Hub",
+            },
+        ],
         "problems": [
             {
                 "severity": "medium",
