@@ -20,9 +20,11 @@ from typing import Any, Callable, Iterable
 
 try:
     import boto3
+    from botocore.config import Config
     from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 except ModuleNotFoundError:  # Demo mode and pure tests do not need the AWS SDK.
     boto3 = None
+    Config = None
     BotoCoreError = ClientError = NoCredentialsError = RuntimeError
 
 
@@ -230,7 +232,15 @@ class AwsAudit:
         self.errors: list[dict[str, str]] = []
 
     def client(self, service: str, region: str | None = None):
-        return self.session.client(service, region_name=region or self.regions[0])
+        return self.session.client(
+            service,
+            region_name=region or self.regions[0],
+            config=Config(
+                connect_timeout=3,
+                read_timeout=20,
+                retries={"max_attempts": 2, "mode": "standard"},
+            ),
+        )
 
     def capture(self, section: str, operation: Callable[[], Any], default: Any) -> Any:
         try:
@@ -265,13 +275,16 @@ class AwsAudit:
 
     def _resource_explorer(self, region: str) -> list[dict[str, Any]]:
         client = self.client("resource-explorer-2", region)
-        views = client.list_views().get("Views", [])
-        if not views:
+        view_arn = client.get_default_view().get("ViewArn")
+        if not view_arn:
+            views = client.list_views().get("Views", [])
+            view_arn = views[0] if views else None
+        if not view_arn:
             return []
 
         paginator = client.get_paginator("list_resources")
         rows: list[dict[str, Any]] = []
-        for page in paginator.paginate(ViewArn=views[0], Filters={"FilterString": ""}):
+        for page in paginator.paginate(ViewArn=view_arn, Filters={"FilterString": ""}):
             for item in page.get("Resources", []):
                 arn = item["Arn"]
                 rows.append(
@@ -383,7 +396,7 @@ class AwsAudit:
         client = self.client("ce", "us-east-1")
         today = datetime.now(timezone.utc).date()
         start = _month_start(today, -5)
-        end = today + timedelta(days=1)
+        end = today
         self.budget.reserve("cost_explorer")
         response = client.get_cost_and_usage(
             TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
@@ -411,10 +424,22 @@ class AwsAudit:
         today = datetime.now(timezone.utc).date()
         client = self.client("ce", "us-east-1")
         self.budget.reserve("cost_explorer")
-        response = client.get_anomalies(
-            DateInterval={"StartDate": (today - timedelta(days=90)).isoformat(), "EndDate": today.isoformat()},
-            MaxResults=100,
-        )
+        params: dict[str, Any] = {
+            "DateInterval": {
+                "StartDate": (today - timedelta(days=90)).isoformat(),
+                "EndDate": today.isoformat(),
+            },
+            "MaxResults": 100,
+        }
+        anomalies: list[dict[str, Any]] = []
+        while True:
+            response = client.get_anomalies(**params)
+            anomalies.extend(response.get("Anomalies", []))
+            token = response.get("NextPageToken")
+            if not token:
+                break
+            self.budget.reserve("cost_explorer")
+            params["NextPageToken"] = token
         return [
             {
                 "start": item["AnomalyStartDate"],
@@ -424,7 +449,7 @@ class AwsAudit:
                 "percentage": round(float(item.get("Impact", {}).get("TotalImpactPercentage", 0)), 1),
                 "root_causes": item.get("RootCauses", []),
             }
-            for item in response.get("Anomalies", [])
+            for item in anomalies
         ]
 
     def recommendations(self) -> list[dict[str, Any]]:
@@ -440,7 +465,8 @@ class AwsAudit:
                 rows.append(
                     {
                         "action": item.get("actionType", "Review"),
-                        "resource_type": item.get("resourceType", "unknown"),
+                        "resource_type": item.get("currentResourceType", "unknown"),
+                        "recommended_resource_type": item.get("recommendedResourceType", "unknown"),
                         "resource_id": item.get("resourceId") or item.get("resourceArn", "unknown"),
                         "region": item.get("region", "global"),
                         "monthly_cost_usd": round(float(item.get("estimatedMonthlyCost", 0)), 2),
@@ -472,17 +498,33 @@ class AwsAudit:
         rows: list[dict[str, Any]] = []
         for entry in global_client.list_buckets().get("Buckets", []):
             name = entry["Name"]
-            location = global_client.get_bucket_location(Bucket=name).get("LocationConstraint")
+            location = self.capture(
+                f"s3-location:{name}",
+                lambda name=name: global_client.get_bucket_location(Bucket=name).get("LocationConstraint"),
+                entry.get("BucketRegion") or "us-east-1",
+            )
             region = "us-east-1" if location in (None, "") else ("eu-west-1" if location == "EU" else location)
             client = self.client("s3", region)
-            versioning = client.get_bucket_versioning(Bucket=name).get("Status", "Disabled")
-            logging = bool(client.get_bucket_logging(Bucket=name).get("LoggingEnabled"))
+            versioning = self.capture(
+                f"s3-versioning:{name}",
+                lambda client=client, name=name: client.get_bucket_versioning(Bucket=name).get("Status", "Disabled"),
+                "Unknown",
+            )
+            logging = self.capture(
+                f"s3-logging:{name}",
+                lambda client=client, name=name: bool(client.get_bucket_logging(Bucket=name).get("LoggingEnabled")),
+                None,
+            )
             lifecycle = self.capture(
                 f"s3-lifecycle:{name}",
-                lambda client=client, name=name: client.get_bucket_lifecycle_configuration(Bucket=name).get("Rules", []),
+                lambda client=client, name=name: self._lifecycle_rules(client, name),
                 [],
             )
-            uploads, upload_bytes = self._multipart_uploads(client, name, depth == "deep")
+            uploads, upload_bytes = self.capture(
+                f"s3-multipart:{name}",
+                lambda client=client, name=name: self._multipart_uploads(client, name, depth == "deep"),
+                ([], None),
+            )
             rows.append(
                 {
                     "name": name,
@@ -503,6 +545,15 @@ class AwsAudit:
             )
         self._add_s3_cloudwatch_metrics(rows)
         return sorted(rows, key=lambda row: row["total_storage_tb"], reverse=True)
+
+    @staticmethod
+    def _lifecycle_rules(client, bucket: str) -> list[dict[str, Any]]:
+        try:
+            return client.get_bucket_lifecycle_configuration(Bucket=bucket).get("Rules", [])
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "NoSuchLifecycleConfiguration":
+                return []
+            raise
 
     def _multipart_uploads(self, client, bucket: str, deep: bool) -> tuple[list[dict[str, Any]], int | None]:
         uploads: list[dict[str, Any]] = []
@@ -591,17 +642,24 @@ class AwsAudit:
         client = self.client("ce", "us-east-1")
         today = datetime.now(timezone.utc).date()
         self.budget.reserve("cost_explorer")
-        response = client.get_cost_and_usage(
-            TimePeriod={"Start": _month_start(today, -5).isoformat(), "End": (today + timedelta(days=1)).isoformat()},
-            Granularity="MONTHLY",
-            Metrics=["UnblendedCost", "UsageQuantity"],
-            Filter={"Dimensions": {"Key": "SERVICE", "Values": ["Amazon Simple Storage Service"]}},
-            GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
-        )
+        params: dict[str, Any] = {
+            "TimePeriod": {"Start": _month_start(today, -5).isoformat(), "End": today.isoformat()},
+            "Granularity": "MONTHLY",
+            "Metrics": ["UnblendedCost", "UsageQuantity"],
+            "Filter": {"Dimensions": {"Key": "SERVICE", "Values": ["Amazon Simple Storage Service"]}},
+            "GroupBy": [{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+        }
         totals: Counter[str] = Counter()
-        for result in response.get("ResultsByTime", []):
-            for group in result.get("Groups", []):
-                totals[group["Keys"][0]] += float(group["Metrics"]["UnblendedCost"]["Amount"])
+        while True:
+            response = client.get_cost_and_usage(**params)
+            for result in response.get("ResultsByTime", []):
+                for group in result.get("Groups", []):
+                    totals[group["Keys"][0]] += float(group["Metrics"]["UnblendedCost"]["Amount"])
+            token = response.get("NextPageToken")
+            if not token:
+                break
+            self.budget.reserve("cost_explorer")
+            params["NextPageToken"] = token
         return [
             {"usage_type": key, "cost_usd": round(value, 2)}
             for key, value in totals.most_common()
@@ -665,6 +723,23 @@ class AwsAudit:
     def collect(self, s3_depth: str = "basic") -> dict[str, Any]:
         resources = self.resources()
         costs = self.costs()
+        s3_report = self.s3(s3_depth)
+        for bucket in s3_report["buckets"]:
+            resources.append(
+                {
+                    "service": "s3",
+                    "type": "AWS::S3::Bucket",
+                    "name": bucket["name"],
+                    "arn": f"arn:aws:s3:::{bucket['name']}",
+                    "region": bucket["region"],
+                    "state": "available",
+                    "source": "S3 API",
+                }
+            )
+        resources = sorted(
+            {row["arn"]: row for row in resources}.values(),
+            key=lambda row: (row["service"], row["region"], row["name"]),
+        )
         report = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "mode": "live",
@@ -675,7 +750,7 @@ class AwsAudit:
             "costs": costs,
             "recommendations": self.recommendations(),
             "problems": self.problems(),
-            "s3": self.s3(s3_depth),
+            "s3": s3_report,
             "api_cost_guard": {
                 "estimated_usd": round(self.budget.spent_usd, 4),
                 "limit_usd": self.budget.max_usd,
@@ -756,6 +831,18 @@ def demo_report() -> dict[str, Any]:
             "storage_classes": {"STANDARD": 21504.0},
         },
     ]
+    resources.extend(
+        {
+            "service": "s3",
+            "type": "AWS::S3::Bucket",
+            "name": bucket["name"],
+            "arn": f"arn:aws:s3:::{bucket['name']}",
+            "region": bucket["region"],
+            "state": "available",
+            "source": "demo",
+        }
+        for bucket in s3_buckets
+    )
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": "demo",
