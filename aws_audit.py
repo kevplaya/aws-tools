@@ -187,6 +187,323 @@ def s3_findings(buckets: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(findings, key=lambda row: (order[row["severity"]], row["bucket"]))
 
 
+def _tag_name(item: dict[str, Any], key: str = "Tags") -> str:
+    for tag in item.get(key) or []:
+        if tag.get("Key") == "Name":
+            return str(tag["Value"])
+    return ""
+
+
+def _route_target(route: dict[str, Any]) -> str:
+    for key in (
+        "GatewayId",
+        "NatGatewayId",
+        "TransitGatewayId",
+        "VpcPeeringConnectionId",
+        "NetworkInterfaceId",
+        "InstanceId",
+        "CarrierGatewayId",
+        "VpcEndpointId",
+        "LocalGatewayId",
+        "EgressOnlyInternetGatewayId",
+    ):
+        if route.get(key):
+            return str(route[key])
+    return "unknown"
+
+
+def _route_rows(table: dict[str, Any]) -> list[dict[str, str]]:
+    rows = [
+        {
+            "destination": str(
+                route.get("DestinationCidrBlock")
+                or route.get("DestinationIpv6CidrBlock")
+                or route.get("DestinationPrefixListId")
+                or "unknown"
+            ),
+            "target": _route_target(route),
+            "state": str(route.get("State", "")),
+        }
+        for route in table.get("Routes", [])
+    ]
+    # Default route first: it decides whether the subnet is public, private or isolated.
+    return sorted(rows, key=lambda row: (row["destination"] != "0.0.0.0/0", row["destination"]))
+
+
+def subnet_tier(default_target: str) -> str:
+    """Classify a subnet by where its 0.0.0.0/0 route points."""
+    if not default_target:
+        return "isolated"
+    if default_target.startswith("igw-"):
+        return "public"
+    if default_target.startswith("nat-"):
+        return "private"
+    return "routed"
+
+
+def _eni_resource(eni: dict[str, Any], instances: dict[str, dict[str, Any]]) -> dict[str, str]:
+    description = str(eni.get("Description") or "")
+    instance_id = (eni.get("Attachment") or {}).get("InstanceId")
+    instance = instances.get(instance_id or "")
+    if instance:
+        name = _tag_name(instance) or instance_id
+        return {
+            "kind": "ec2",
+            "label": f"{name} ({instance.get('InstanceType', '-')}, {instance['State']['Name']})",
+            "id": instance_id,
+        }
+    prefixes = {
+        "AWS Lambda VPC ENI-": "lambda",
+        "Interface for NAT Gateway ": "nat",
+        "VPC Endpoint Interface ": "endpoint",
+        "ELB ": "elb",
+        "ElastiCache ": "elasticache",
+        "RDSNetworkInterface": "rds",
+    }
+    for prefix, kind in prefixes.items():
+        if description.startswith(prefix):
+            return {
+                "kind": kind,
+                "label": description[len(prefix):] or kind.upper(),
+                "id": eni["NetworkInterfaceId"],
+            }
+    return {
+        "kind": eni.get("InterfaceType", "interface"),
+        "label": description or eni["NetworkInterfaceId"],
+        "id": eni["NetworkInterfaceId"],
+    }
+
+
+def _duplicate_names(items: Iterable[dict[str, Any]], id_key: str) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for item in items:
+        name = _tag_name(item)
+        if name:
+            grouped.setdefault(name, []).append(item[id_key])
+    return {name: ids for name, ids in grouped.items() if len(ids) > 1}
+
+
+def topology_findings(vpc: dict[str, Any]) -> list[dict[str, str]]:
+    """Name collisions and routing surprises that make a resource map hard to read."""
+    findings: list[dict[str, str]] = []
+    for name, ids in sorted(vpc["duplicate_route_table_names"].items()):
+        routes = {
+            table["route_table_id"]: {(row["destination"], row["target"]) for row in table["routes"]}
+            for table in vpc["route_tables"]
+            if table["route_table_id"] in ids
+        }
+        identical = len(set(map(frozenset, routes.values()))) == 1
+        findings.append(
+            {
+                "severity": "medium",
+                "check": "duplicate_route_table_name",
+                "title": f"라우팅 테이블 이름 중복: {name}",
+                "detail": f"{len(ids)}개가 같은 이름을 씁니다 ({', '.join(sorted(ids))}). "
+                + ("라우트 내용은 동일합니다." if identical else "라우트 내용이 서로 달라 잘못 고를 위험이 큽니다."),
+            }
+        )
+    for name, ids in sorted(vpc["duplicate_subnet_names"].items()):
+        findings.append(
+            {
+                "severity": "medium",
+                "check": "duplicate_subnet_name",
+                "title": f"서브넷 이름 중복: {name}",
+                "detail": f"{len(ids)}개가 같은 이름을 씁니다 ({', '.join(sorted(ids))}).",
+            }
+        )
+    inherited = [row for row in vpc["subnets"] if not row["route_table_explicit"]]
+    if inherited:
+        findings.append(
+            {
+                "severity": "medium",
+                "check": "implicit_main_route_table",
+                "title": f"메인 라우팅 테이블을 상속하는 서브넷 {len(inherited)}개",
+                "detail": "명시적 연결이 없어 메인 라우팅 테이블이 바뀌면 통신 경로가 함께 바뀝니다: "
+                + ", ".join(f"{row['name'] or row['subnet_id']}" for row in inherited),
+            }
+        )
+    for table in vpc["route_tables"]:
+        for row in table["routes"]:
+            if not row["target"].startswith("eni-"):
+                continue
+            findings.append(
+                {
+                    "severity": "high",
+                    "check": "instance_routed_traffic",
+                    "title": f"{row['destination']} 트래픽이 EC2 ENI 한 개를 지납니다",
+                    "detail": f"{table['route_table_id']}({table['name'] or '이름 없음'})의 "
+                    f"{row['destination']} 경로가 {row['target']}로 향합니다. "
+                    "해당 인스턴스가 멈추면 이 대역 통신이 전부 끊깁니다.",
+                }
+            )
+    empty = [row for row in vpc["subnets"] if row["eni_count"] == 0]
+    if empty:
+        findings.append(
+            {
+                "severity": "info",
+                "check": "empty_subnet",
+                "title": f"사용 중인 리소스가 없는 서브넷 {len(empty)}개",
+                "detail": ", ".join(f"{row['name'] or row['subnet_id']}({row['cidr']})" for row in empty),
+            }
+        )
+    routed_peerings = {
+        row["target"] for table in vpc["route_tables"] for row in table["routes"] if row["target"].startswith("pcx-")
+    }
+    for peering in vpc["peerings"]:
+        if peering["peering_id"] not in routed_peerings:
+            findings.append(
+                {
+                    "severity": "info",
+                    "check": "unrouted_peering",
+                    "title": f"라우트가 없는 피어링: {peering['peering_id']}",
+                    "detail": f"{peering['name'] or '이름 없음'} 연결은 active지만 이 VPC의 라우팅 테이블이 참조하지 않습니다.",
+                }
+            )
+    order = {"high": 0, "medium": 1, "info": 2}
+    return sorted(findings, key=lambda row: (order[row["severity"]], row["title"]))
+
+
+def vpc_topology(region: str, data: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Join EC2 network descriptions into one resource map per VPC.
+
+    Network interfaces are the ground truth for subnet occupancy: RDS, Lambda,
+    load balancers and NAT gateways all show up there even though each service
+    reports its own placement differently.
+    """
+    instances = {
+        instance["InstanceId"]: instance
+        for reservation in data.get("reservations", [])
+        for instance in reservation.get("Instances", [])
+        if instance["State"]["Name"] != "terminated"
+    }
+    result = []
+    for vpc in data.get("vpcs", []):
+        vpc_id = vpc["VpcId"]
+        subnets = [row for row in data.get("subnets", []) if row["VpcId"] == vpc_id]
+        tables = [row for row in data.get("route_tables", []) if row["VpcId"] == vpc_id]
+        enis = [row for row in data.get("network_interfaces", []) if row["VpcId"] == vpc_id]
+
+        main_table = next(
+            (t for t in tables if any(a.get("Main") for a in t.get("Associations", []))), None
+        )
+        table_by_subnet = {
+            association["SubnetId"]: table
+            for table in tables
+            for association in table.get("Associations", [])
+            if association.get("SubnetId")
+        }
+        enis_by_subnet: dict[str, list[dict[str, Any]]] = {}
+        for eni in enis:
+            enis_by_subnet.setdefault(eni["SubnetId"], []).append(eni)
+
+        route_table_rows = []
+        for table in sorted(tables, key=lambda t: (_tag_name(t), t["RouteTableId"])):
+            route_table_rows.append(
+                {
+                    "route_table_id": table["RouteTableId"],
+                    "name": _tag_name(table),
+                    "main": any(a.get("Main") for a in table.get("Associations", [])),
+                    "routes": _route_rows(table),
+                    "subnet_ids": [
+                        a["SubnetId"] for a in table.get("Associations", []) if a.get("SubnetId")
+                    ],
+                }
+            )
+
+        subnet_rows = []
+        for subnet in sorted(subnets, key=lambda s: s["CidrBlock"]):
+            subnet_id = subnet["SubnetId"]
+            table = table_by_subnet.get(subnet_id) or main_table or {}
+            default_target = next(
+                (row["target"] for row in _route_rows(table) if row["destination"] == "0.0.0.0/0"), ""
+            )
+            resources = [_eni_resource(eni, instances) for eni in enis_by_subnet.get(subnet_id, [])]
+            counts: dict[str, int] = {}
+            for item in resources:
+                counts[item["kind"]] = counts.get(item["kind"], 0) + 1
+            subnet_rows.append(
+                {
+                    "subnet_id": subnet_id,
+                    "name": _tag_name(subnet),
+                    "cidr": subnet["CidrBlock"],
+                    "az": subnet["AvailabilityZone"],
+                    "tier": subnet_tier(default_target),
+                    "default_target": default_target,
+                    "route_table_id": table.get("RouteTableId", ""),
+                    "route_table_name": _tag_name(table),
+                    "route_table_explicit": subnet_id in table_by_subnet,
+                    "available_ips": int(subnet.get("AvailableIpAddressCount", 0)),
+                    "auto_public_ip": bool(subnet.get("MapPublicIpOnLaunch")),
+                    "eni_count": len(resources),
+                    "resource_counts": dict(sorted(counts.items())),
+                    "resources": sorted(resources, key=lambda row: (row["kind"], row["label"])),
+                }
+            )
+
+        nat_rows = [
+            {
+                "nat_id": nat["NatGatewayId"],
+                "name": _tag_name(nat),
+                "state": nat.get("State", "-"),
+                "subnet_id": nat.get("SubnetId", "-"),
+                "public_ip": (nat.get("NatGatewayAddresses") or [{}])[0].get("PublicIp", "-"),
+            }
+            for nat in data.get("nat_gateways", [])
+            if nat.get("VpcId") == vpc_id
+        ]
+        peering_rows = []
+        for peering in data.get("peerings", []):
+            requester, accepter = peering["RequesterVpcInfo"], peering["AccepterVpcInfo"]
+            if vpc_id not in (requester["VpcId"], accepter["VpcId"]):
+                continue
+            other = accepter if requester["VpcId"] == vpc_id else requester
+            peering_rows.append(
+                {
+                    "peering_id": peering["VpcPeeringConnectionId"],
+                    "name": _tag_name(peering),
+                    "state": peering.get("Status", {}).get("Code", "-"),
+                    "peer_vpc_id": other["VpcId"],
+                    "peer_cidr": other.get("CidrBlock", "-"),
+                    "peer_account": other.get("OwnerId", "-"),
+                }
+            )
+
+        entry = {
+            "region": region,
+            "vpc_id": vpc_id,
+            "name": _tag_name(vpc),
+            "cidr": vpc.get("CidrBlock", "-"),
+            "is_default": bool(vpc.get("IsDefault")),
+            "main_route_table_id": (main_table or {}).get("RouteTableId", ""),
+            "subnets": subnet_rows,
+            "route_tables": route_table_rows,
+            "internet_gateways": [
+                {"igw_id": igw["InternetGatewayId"], "name": _tag_name(igw)}
+                for igw in data.get("internet_gateways", [])
+                if any(a.get("VpcId") == vpc_id for a in igw.get("Attachments", []))
+            ],
+            "nat_gateways": nat_rows,
+            "peerings": peering_rows,
+            "endpoints": [
+                {
+                    "endpoint_id": endpoint["VpcEndpointId"],
+                    "service": endpoint.get("ServiceName", "-"),
+                    "type": endpoint.get("VpcEndpointType", "-"),
+                    "state": endpoint.get("State", "-"),
+                    "subnet_ids": endpoint.get("SubnetIds", []),
+                    "route_table_ids": endpoint.get("RouteTableIds", []),
+                }
+                for endpoint in data.get("endpoints", [])
+                if endpoint.get("VpcId") == vpc_id
+            ],
+            "duplicate_route_table_names": _duplicate_names(tables, "RouteTableId"),
+            "duplicate_subnet_names": _duplicate_names(subnets, "SubnetId"),
+        }
+        entry["findings"] = topology_findings(entry)
+        result.append(entry)
+    return sorted(result, key=lambda row: (not row["is_default"], row["vpc_id"]))
+
+
 @dataclass
 class ApiBudget:
     """Conservative request-cost guard for optional deep inspections.
@@ -720,6 +1037,40 @@ class AwsAudit:
                     )
         return rows
 
+    def topology(self) -> list[dict[str, Any]]:
+        vpcs: list[dict[str, Any]] = []
+        for region in self.regions:
+            vpcs.extend(
+                self.capture(f"topology:{region}", lambda region=region: self._topology(region), [])
+            )
+        return vpcs
+
+    def _topology(self, region: str) -> list[dict[str, Any]]:
+        client = self.client("ec2", region)
+        # EC2 describe calls are free; the guard still records them for the audit trail.
+        self.budget.reserve("free")
+
+        def paginated(operation: str, key: str) -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            for page in client.get_paginator(operation).paginate():
+                rows.extend(page.get(key, []))
+            return rows
+
+        return vpc_topology(
+            region,
+            {
+                "vpcs": paginated("describe_vpcs", "Vpcs"),
+                "subnets": paginated("describe_subnets", "Subnets"),
+                "route_tables": paginated("describe_route_tables", "RouteTables"),
+                "network_interfaces": paginated("describe_network_interfaces", "NetworkInterfaces"),
+                "reservations": paginated("describe_instances", "Reservations"),
+                "internet_gateways": paginated("describe_internet_gateways", "InternetGateways"),
+                "nat_gateways": paginated("describe_nat_gateways", "NatGateways"),
+                "peerings": paginated("describe_vpc_peering_connections", "VpcPeeringConnections"),
+                "endpoints": paginated("describe_vpc_endpoints", "VpcEndpoints"),
+            },
+        )
+
     def collect(self, s3_depth: str = "basic") -> dict[str, Any]:
         resources = self.resources()
         costs = self.costs()
@@ -751,6 +1102,7 @@ class AwsAudit:
             "recommendations": self.recommendations(),
             "problems": self.problems(),
             "s3": s3_report,
+            "topology": self.topology(),
             "api_cost_guard": {
                 "estimated_usd": round(self.budget.spent_usd, 4),
                 "limit_usd": self.budget.max_usd,
@@ -924,8 +1276,202 @@ def demo_report() -> dict[str, Any]:
             ],
             "depth": "deep",
         },
+        "topology": vpc_topology("ap-northeast-2", _demo_network()),
         "api_cost_guard": {"estimated_usd": 0.0, "limit_usd": 1.0},
         "errors": [],
+    }
+
+
+def _demo_network() -> dict[str, list[dict[str, Any]]]:
+    """AWS-shaped network fixtures so demo mode runs the real topology code."""
+
+    def name(value: str) -> list[dict[str, str]]:
+        return [{"Key": "Name", "Value": value}]
+
+    return {
+        "vpcs": [
+            {"VpcId": "vpc-demo", "CidrBlock": "10.20.0.0/16", "IsDefault": True, "Tags": name("default")}
+        ],
+        "subnets": [
+            {
+                "SubnetId": "subnet-public-a",
+                "VpcId": "vpc-demo",
+                "CidrBlock": "10.20.0.0/20",
+                "AvailabilityZone": "ap-northeast-2a",
+                "AvailableIpAddressCount": 4085,
+                "MapPublicIpOnLaunch": True,
+                "Tags": name("public-a"),
+            },
+            {
+                "SubnetId": "subnet-public-c",
+                "VpcId": "vpc-demo",
+                "CidrBlock": "10.20.16.0/20",
+                "AvailabilityZone": "ap-northeast-2c",
+                "AvailableIpAddressCount": 4090,
+                "MapPublicIpOnLaunch": True,
+                "Tags": name("public-c"),
+            },
+            {
+                "SubnetId": "subnet-app-a",
+                "VpcId": "vpc-demo",
+                "CidrBlock": "10.20.32.0/20",
+                "AvailabilityZone": "ap-northeast-2a",
+                "AvailableIpAddressCount": 4088,
+                "Tags": name("app-a"),
+            },
+            {
+                "SubnetId": "subnet-db-a",
+                "VpcId": "vpc-demo",
+                "CidrBlock": "10.20.48.0/24",
+                "AvailabilityZone": "ap-northeast-2a",
+                "AvailableIpAddressCount": 251,
+                "Tags": name("db-private"),
+            },
+            {
+                "SubnetId": "subnet-db-c",
+                "VpcId": "vpc-demo",
+                "CidrBlock": "10.20.49.0/24",
+                "AvailabilityZone": "ap-northeast-2c",
+                "AvailableIpAddressCount": 251,
+                "Tags": name("db-private"),
+            },
+        ],
+        "route_tables": [
+            {
+                "RouteTableId": "rtb-main",
+                "VpcId": "vpc-demo",
+                "Tags": name("public-rt"),
+                "Associations": [{"Main": True}, {"SubnetId": "subnet-public-a"}],
+                "Routes": [
+                    {"DestinationCidrBlock": "10.20.0.0/16", "GatewayId": "local", "State": "active"},
+                    {"DestinationCidrBlock": "0.0.0.0/0", "GatewayId": "igw-demo", "State": "active"},
+                    {
+                        "DestinationCidrBlock": "100.64.0.0/10",
+                        "NetworkInterfaceId": "eni-router",
+                        "State": "active",
+                    },
+                ],
+            },
+            {
+                "RouteTableId": "rtb-app",
+                "VpcId": "vpc-demo",
+                "Tags": name("app-rt"),
+                "Associations": [{"SubnetId": "subnet-app-a"}],
+                "Routes": [
+                    {"DestinationCidrBlock": "10.20.0.0/16", "GatewayId": "local", "State": "active"},
+                    {"DestinationCidrBlock": "0.0.0.0/0", "NatGatewayId": "nat-demo", "State": "active"},
+                ],
+            },
+            {
+                "RouteTableId": "rtb-db-1",
+                "VpcId": "vpc-demo",
+                "Tags": name("db-rt"),
+                "Associations": [{"SubnetId": "subnet-db-a"}],
+                "Routes": [
+                    {"DestinationCidrBlock": "10.20.0.0/16", "GatewayId": "local", "State": "active"},
+                    {
+                        "DestinationCidrBlock": "10.30.0.0/16",
+                        "VpcPeeringConnectionId": "pcx-demo",
+                        "State": "active",
+                    },
+                ],
+            },
+            {
+                "RouteTableId": "rtb-db-2",
+                "VpcId": "vpc-demo",
+                "Tags": name("db-rt"),
+                "Associations": [{"SubnetId": "subnet-db-c"}],
+                "Routes": [
+                    {"DestinationCidrBlock": "10.20.0.0/16", "GatewayId": "local", "State": "active"}
+                ],
+            },
+        ],
+        "network_interfaces": [
+            {
+                "NetworkInterfaceId": "eni-router",
+                "VpcId": "vpc-demo",
+                "SubnetId": "subnet-public-a",
+                "InterfaceType": "interface",
+                "Description": "",
+                "Attachment": {"InstanceId": "i-demo1"},
+            },
+            {
+                "NetworkInterfaceId": "eni-alb",
+                "VpcId": "vpc-demo",
+                "SubnetId": "subnet-public-c",
+                "InterfaceType": "interface",
+                "Description": "ELB app/portfolio-alb/abc123",
+            },
+            {
+                "NetworkInterfaceId": "eni-nat",
+                "VpcId": "vpc-demo",
+                "SubnetId": "subnet-public-a",
+                "InterfaceType": "nat_gateway",
+                "Description": "Interface for NAT Gateway nat-demo",
+            },
+            {
+                "NetworkInterfaceId": "eni-lambda",
+                "VpcId": "vpc-demo",
+                "SubnetId": "subnet-app-a",
+                "InterfaceType": "lambda",
+                "Description": "AWS Lambda VPC ENI-cost-digest",
+            },
+            {
+                "NetworkInterfaceId": "eni-rds",
+                "VpcId": "vpc-demo",
+                "SubnetId": "subnet-db-a",
+                "InterfaceType": "interface",
+                "Description": "RDSNetworkInterface",
+            },
+        ],
+        "reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-demo1",
+                        "InstanceType": "t3.nano",
+                        "State": {"Name": "running"},
+                        "Tags": name("portfolio-api"),
+                    }
+                ]
+            }
+        ],
+        "internet_gateways": [
+            {
+                "InternetGatewayId": "igw-demo",
+                "Tags": name("demo-igw"),
+                "Attachments": [{"VpcId": "vpc-demo", "State": "available"}],
+            }
+        ],
+        "nat_gateways": [
+            {
+                "NatGatewayId": "nat-demo",
+                "VpcId": "vpc-demo",
+                "SubnetId": "subnet-public-a",
+                "State": "available",
+                "Tags": name("demo-nat"),
+                "NatGatewayAddresses": [{"PublicIp": "203.0.113.10", "PrivateIp": "10.20.1.5"}],
+            }
+        ],
+        "peerings": [
+            {
+                "VpcPeeringConnectionId": "pcx-demo",
+                "Status": {"Code": "active"},
+                "Tags": name("demo-to-prod"),
+                "RequesterVpcInfo": {"VpcId": "vpc-demo", "CidrBlock": "10.20.0.0/16", "OwnerId": "000000000000"},
+                "AccepterVpcInfo": {"VpcId": "vpc-prod", "CidrBlock": "10.30.0.0/16", "OwnerId": "000000000000"},
+            }
+        ],
+        "endpoints": [
+            {
+                "VpcEndpointId": "vpce-demo",
+                "VpcId": "vpc-demo",
+                "ServiceName": "com.amazonaws.ap-northeast-2.s3",
+                "VpcEndpointType": "Gateway",
+                "State": "available",
+                "RouteTableIds": ["rtb-app"],
+            }
+        ],
     }
 
 
