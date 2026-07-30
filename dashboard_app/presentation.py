@@ -77,6 +77,33 @@ PRICE_LABELS = {
     "it_monitor_per_1000": "Intelligent-Tiering 객체 모니터링 비용($/1,000개)",
 }
 
+TIER_LABELS = {
+    "public": "공개(인터넷 게이트웨이)",
+    "private": "비공개(NAT 경유)",
+    "isolated": "격리(내부 통신만)",
+    "routed": "기타 경로",
+}
+
+ENI_KIND_LABELS = {
+    "ec2": "EC2 가상 서버",
+    "rds": "RDS 데이터베이스",
+    "lambda": "Lambda 함수",
+    "elb": "로드밸런서",
+    "elasticache": "ElastiCache 캐시",
+    "nat": "NAT Gateway",
+    "endpoint": "VPC 엔드포인트",
+    "interface": "기타 네트워크 인터페이스",
+}
+
+TOPOLOGY_ACTIONS = {
+    "duplicate_route_table_name": "이름 규칙을 정해 다시 태깅하고, 라우트가 다르면 용도를 이름에 드러냅니다.",
+    "duplicate_subnet_name": "AZ나 용도를 이름에 넣어 서로 구분되게 다시 태깅합니다.",
+    "implicit_main_route_table": "의도한 라우팅 테이블을 서브넷에 명시적으로 연결합니다.",
+    "instance_routed_traffic": "NAT Gateway나 Transit Gateway로 옮겨 단일 인스턴스 의존을 없앱니다.",
+    "empty_subnet": "쓰지 않는 서브넷은 삭제하거나, 남길 이유를 태그에 적어 둡니다.",
+    "unrouted_peering": "필요하면 라우트를 추가하고, 필요 없으면 피어링을 삭제합니다.",
+}
+
 S3_CHECKS = {
     "incomplete_multipart": ("미완료 대용량 업로드", "완료하거나 중단해 불필요한 저장 비용을 없앱니다."),
     "abort_lifecycle": ("미완료 업로드 자동 정리 규칙", "일정 기간이 지난 업로드를 자동 삭제하도록 Lifecycle 규칙을 설정합니다."),
@@ -187,8 +214,107 @@ def _s3_findings(findings: Iterable[dict[str, Any]], buckets: Iterable[dict[str,
     return result
 
 
+def _subnet_row(subnet: dict[str, Any]) -> dict[str, Any]:
+    counts = subnet.get("resource_counts", {})
+    return {
+        **subnet,
+        "label": subnet["name"] or subnet["subnet_id"],
+        "tier_label": TIER_LABELS.get(subnet["tier"], subnet["tier"]),
+        "default_target": subnet["default_target"] or "없음",
+        "route_table_label": subnet["route_table_name"] or subnet["route_table_id"] or "-",
+        "summary": ", ".join(
+            f"{ENI_KIND_LABELS.get(kind, kind)} {count}개" for kind, count in counts.items()
+        )
+        or "리소스 없음",
+        "resources": [
+            {**item, "kind_label": ENI_KIND_LABELS.get(item["kind"], item["kind"])}
+            for item in subnet.get("resources", [])
+        ],
+    }
+
+
+def _tier_groups(subnets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Lay the map out as tier rows and availability-zone columns."""
+    groups = []
+    for tier in ("public", "private", "isolated", "routed"):
+        rows = [row for row in subnets if row["tier"] == tier]
+        if not rows:
+            continue
+        zones = sorted({row["az"] for row in rows})
+        groups.append(
+            {
+                "tier": tier,
+                "tier_label": TIER_LABELS[tier],
+                "subnet_count": len(rows),
+                "columns": [
+                    {"az": az, "subnets": [row for row in rows if row["az"] == az]} for az in zones
+                ],
+            }
+        )
+    return groups
+
+
+def build_topology(topology: list[dict[str, Any]], selected_vpc: str = "") -> dict[str, Any]:
+    """Turn the collected resource map into a selectable per-VPC view."""
+    vpcs = []
+    for vpc in topology:
+        subnets = [_subnet_row(row) for row in vpc["subnets"]]
+        duplicate_tables = set(sum(vpc["duplicate_route_table_names"].values(), []))
+        vpcs.append(
+            {
+                **vpc,
+                "label": vpc["name"] or vpc["vpc_id"],
+                "subnets": subnets,
+                "tier_groups": _tier_groups(subnets),
+                "azs": sorted({row["az"] for row in subnets}),
+                "counts": {
+                    "subnets": len(subnets),
+                    "route_tables": len(vpc["route_tables"]),
+                    "enis": sum(row["eni_count"] for row in subnets),
+                    "findings": len(vpc["findings"]),
+                    "empty_subnets": sum(1 for row in subnets if row["eni_count"] == 0),
+                },
+                "route_tables": [
+                    {
+                        **table,
+                        "label": table["name"] or table["route_table_id"],
+                        "duplicate_name": table["route_table_id"] in duplicate_tables,
+                        "subnet_labels": [
+                            next(
+                                (row["label"] for row in subnets if row["subnet_id"] == subnet_id),
+                                subnet_id,
+                            )
+                            for subnet_id in table["subnet_ids"]
+                        ],
+                    }
+                    for table in vpc["route_tables"]
+                ],
+                "findings": [
+                    {
+                        **finding,
+                        "severity_label": SEVERITY_LABELS.get(finding["severity"], finding["severity"]),
+                        "action": TOPOLOGY_ACTIONS.get(finding["check"], "구성 의도를 확인합니다."),
+                    }
+                    for finding in vpc["findings"]
+                ],
+            }
+        )
+    selected = next((row for row in vpcs if row["vpc_id"] == selected_vpc), None) or (
+        vpcs[0] if vpcs else None
+    )
+    return {
+        "vpcs": vpcs,
+        "selected": selected,
+        "selected_vpc": selected["vpc_id"] if selected else "",
+        "total_findings": sum(len(row["findings"]) for row in vpcs),
+    }
+
+
 def build_dashboard(
-    report: dict[str, Any], tco_inputs: dict[str, Any], resource_query: str = ""
+    report: dict[str, Any],
+    tco_inputs: dict[str, Any],
+    resource_query: str = "",
+    selected_vpc: str = "",
 ) -> dict[str, Any]:
     current_cost, cost_delta, current_estimated = _latest_cost(report)
     recommendations = _recommendations(report.get("recommendations", []))
@@ -337,6 +463,7 @@ def build_dashboard(
         "s3_buckets": bucket_rows,
         "s3_findings": _s3_findings(report.get("s3", {}).get("findings", []), s3_buckets),
         "s3_costs": s3_costs,
+        "topology": build_topology(report.get("topology", []), selected_vpc),
         "tco": tco_rows,
         "tco_inputs": tco_inputs,
         "pricing": [

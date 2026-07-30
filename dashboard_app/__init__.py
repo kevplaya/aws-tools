@@ -93,6 +93,7 @@ def create_app(
                 app.config["DASHBOARD_REPORT"],
                 _tco_inputs(request.args),
                 request.args.get("resource_query", "").strip(),
+                request.args.get("vpc", "").strip(),
             ),
             form=app.config["DASHBOARD_FORM"],
             notice=app.config.pop("DASHBOARD_NOTICE", None),
