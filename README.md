@@ -12,6 +12,8 @@ Solutions Architect 포트폴리오를 위한 **읽기 전용 AWS 진단 대시�
 - 최근 6개월 비용은 어떻게 변했고 어떤 서비스가 지배적인가?
 - Cost Optimization Hub가 제안하는 월 절감액과 실행 난이도는 무엇인가?
 - 현재 ALARM 상태나 EC2 상태 이상이 있는가?
+- 서브넷마다 실제로 무엇이 들어 있고, 그중 어느 것이 인터넷에 열려 있는가?
+- 이름이 비슷한 서브넷과 같은 이름을 쓰는 라우팅 테이블을 어떻게 구분하는가?
 - S3 비용이 저장, 인출, 요청 중 어디에서 발생하는가?
 - 미완료 멀티파트, noncurrent version, lifecycle 누락이 있는가?
 - Standard / Standard-IA / Glacier Instant Retrieval / Intelligent-Tiering 중 무엇이 유리한가?
@@ -88,6 +90,7 @@ python aws_audit.py --profile my-readonly --s3-depth deep --max-api-cost 1.00
 | 비용 이상 | AWS Cost Anomaly Detection | 최근 90일 anomaly |
 | 절감 백로그 | AWS Cost Optimization Hub | 절감액, 노력, restart/rollback |
 | 운영 문제 | CloudWatch + EC2 status | ALARM, instance/system check, scheduled event |
+| 네트워크 토폴로지 | EC2 network read-only APIs | VPC·서브넷·라우팅 테이블·게이트웨이·피어링·엔드포인트, ENI 기반 서브넷 점유 |
 | S3 용량 | S3 daily CloudWatch metrics | bucket·storage class·object count |
 | S3 구조 | S3 read-only APIs | versioning, lifecycle, logging, incomplete MPU |
 | S3 비용 | Cost Explorer usage type | 저장·인출·요청 비용 분해 |

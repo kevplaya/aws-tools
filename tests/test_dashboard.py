@@ -25,6 +25,28 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("별도의 자체 점수나 숨겨진 우선순위는 없습니다", body)
         self.assertNotIn("streamlit", body.casefold())
 
+    def test_topology_tab_shows_the_selected_vpc_map(self):
+        client = create_app(database_path=self.database_path).test_client()
+
+        body = client.get("/?vpc=vpc-demo").get_data(as_text=True)
+
+        self.assertIn("네트워크 토폴로지", body)
+        self.assertIn("비공개(NAT 경유)", body)
+        self.assertIn("메인 라우팅 테이블 상속", body)
+        self.assertIn("라우팅 테이블 이름 중복: db-rt", body)
+        self.assertIn("portfolio-api", body)
+
+    def test_topology_tab_survives_a_report_without_network_data(self):
+        report = demo_report()
+        report.pop("topology")
+        store = SnapshotStore(self.database_path)
+        report["mode"] = "live"
+        store.save(report)
+
+        body = create_app(database_path=self.database_path).test_client().get("/").get_data(as_text=True)
+
+        self.assertIn("조회한 VPC가 없습니다", body)
+
     def test_demo_refresh_keeps_dashboard_available(self):
         response = create_app(database_path=self.database_path).test_client().post(
             "/refresh", data={"mode": "demo"}, follow_redirects=True

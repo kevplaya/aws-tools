@@ -95,12 +95,15 @@
         <p><strong>ARN</strong> AWS 리소스를 유일하게 구분하는 전체 주소입니다.</p>
         <p><strong>Lifecycle 규칙</strong> 오래된 S3 객체나 미완료 업로드를 자동 정리·이동하는 규칙입니다.</p>
         <p><strong>API 비용 상한</strong> 진단 조회 비용이 설정값을 넘기기 전에 멈추는 안전장치입니다.</p>
+        <p><strong>서브넷 연결 등급</strong> 서브넷의 0.0.0.0/0 경로가 인터넷 게이트웨이면 공개, NAT면 비공개, 없으면 격리입니다.</p>
+        <p><strong>메인 라우팅 테이블</strong> 라우팅 테이블을 직접 지정하지 않은 서브넷이 자동으로 따르는 기본 테이블입니다.</p>
       </div>
     </details>
 
     <nav class="tabs" role="tablist" aria-label="점검 영역">
       <button type="button" role="tab" aria-selected="true" aria-controls="overview" data-tab="overview">한눈에 보기</button>
       <button type="button" role="tab" aria-selected="false" aria-controls="resources" data-tab="resources">리소스 찾기</button>
+      <button type="button" role="tab" aria-selected="false" aria-controls="topology" data-tab="topology">네트워크 토폴로지</button>
       <button type="button" role="tab" aria-selected="false" aria-controls="costs" data-tab="costs">비용 분석</button>
       <button type="button" role="tab" aria-selected="false" aria-controls="recommendations" data-tab="recommendations">절감 추천</button>
       <button type="button" role="tab" aria-selected="false" aria-controls="problems" data-tab="problems">운영 문제</button>
@@ -162,6 +165,159 @@
         </table></div>
         <p class="footnote">Resource Explorer를 우선 사용하고, 사용할 수 없으면 EC2·RDS·Lambda API로 조회합니다.</p>
       </article>
+    </section>
+
+    <section id="topology" class="tab-panel" role="tabpanel" hidden>
+      <p class="tab-intro">이름이 비슷한 서브넷과 같은 이름을 쓰는 라우팅 테이블을 구분하고, 각 서브넷 안에 실제로 무엇이 들어 있는지 확인합니다.</p>
+      {% set topo = data.topology %}
+      {% if not topo.selected %}
+        <p class="empty">조회한 VPC가 없습니다. 실제 계정 조회를 실행하거나 EC2 조회 권한을 확인하세요.</p>
+      {% else %}
+        {% set vpc = topo.selected %}
+        <article class="card">
+          <div class="card-heading">
+            <div><span>조회 대상</span><h2>VPC 선택</h2></div>
+            <small>VPC {{ topo.vpcs|length }}개 · 확인할 항목 {{ topo.total_findings }}건</small>
+          </div>
+          <div class="vpc-picker">
+            {% for row in topo.vpcs %}
+              <a class="vpc-chip {% if row.vpc_id == vpc.vpc_id %}active{% endif %}"
+                 href="{{ url_for('index', vpc=row.vpc_id) }}#topology">
+                <strong>{{ row.label }}{% if row.is_default %} <em>default</em>{% endif %}</strong>
+                <small>{{ row.cidr }} · 서브넷 {{ row.counts.subnets }} · {{ row.region }}</small>
+                {% if row.counts.findings %}<span class="chip-count">{{ row.counts.findings }}</span>{% endif %}
+              </a>
+            {% endfor %}
+          </div>
+        </article>
+
+        <section class="metric-grid" aria-label="{{ vpc.label }} 요약">
+          <article class="metric-card"><span>VPC 대역</span><strong>{{ vpc.cidr }}</strong><small>{{ vpc.vpc_id }}</small></article>
+          <article class="metric-card"><span>서브넷</span><strong>{{ vpc.counts.subnets }}개</strong><small>가용영역 {{ vpc.azs|length }}곳</small></article>
+          <article class="metric-card"><span>라우팅 테이블</span><strong>{{ vpc.counts.route_tables }}개</strong></article>
+          <article class="metric-card"><span>네트워크 인터페이스</span><strong>{{ vpc.counts.enis }}개</strong><small>빈 서브넷 {{ vpc.counts.empty_subnets }}개</small></article>
+          <article class="metric-card {% if vpc.counts.findings %}accent{% endif %}"><span>확인할 항목</span><strong>{{ vpc.counts.findings }}건</strong></article>
+        </section>
+
+        {% if vpc.findings %}
+          <article class="card">
+            <div class="card-heading"><div><span>먼저 확인</span><h2>헷갈리거나 위험한 구성</h2></div><small>{{ vpc.findings|length }}건</small></div>
+            <div class="finding-list">
+              {% for row in vpc.findings %}
+                <details><summary><span class="severity {{ row.severity }}">{{ row.severity_label }}</span>{{ row.title }}</summary>
+                  <div><p><strong>발견 내용</strong><br>{{ row.detail }}</p><p><strong>권장 조치</strong><br>{{ row.action }}</p></div>
+                </details>
+              {% endfor %}
+            </div>
+          </article>
+        {% else %}
+          <div class="notice success">이름 중복, 메인 라우팅 테이블 상속, 인스턴스 경유 라우팅 등 확인이 필요한 구성이 발견되지 않았습니다.</div>
+        {% endif %}
+
+        <article class="card">
+          <div class="card-heading">
+            <div><span>구조</span><h2>등급·가용영역별 서브넷 배치</h2></div>
+            <small>가로는 가용영역, 세로는 인터넷 연결 방식</small>
+          </div>
+          <div class="topology-map">
+            {% for group in vpc.tier_groups %}
+              <div class="tier-row">
+                <div class="tier-label {{ group.tier }}"><strong>{{ group.tier_label }}</strong><small>서브넷 {{ group.subnet_count }}개</small></div>
+                <div class="tier-columns">
+                  {% for column in group.columns %}
+                    <div class="az-column">
+                      <p class="az-name">{{ column.az }}</p>
+                      {% for row in column.subnets %}
+                        <div class="subnet-box {% if not row.route_table_explicit %}inherited{% endif %}">
+                          <strong>{{ row.label }}</strong>
+                          <code>{{ row.cidr }}</code>
+                          <small>{{ row.summary }}</small>
+                          <small class="subnet-route">경로 {{ row.route_table_label }} → {{ row.default_target }}</small>
+                          {% if not row.route_table_explicit %}<small class="subnet-warn">메인 라우팅 테이블 상속</small>{% endif %}
+                        </div>
+                      {% endfor %}
+                    </div>
+                  {% endfor %}
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+          <p class="footnote">서브넷 안의 리소스는 네트워크 인터페이스를 역추적한 결과입니다. RDS·Lambda·로드밸런서·NAT Gateway도 같은 방식으로 위치를 확인합니다.</p>
+        </article>
+
+        <article class="card table-card">
+          <div class="card-heading"><div><span>서브넷 상세</span><h2>서브넷별 라우팅과 내부 리소스</h2></div><small>{{ vpc.subnets|length }}개</small></div>
+          <div class="table-scroll"><table>
+            <thead><tr><th>이름</th><th>대역</th><th>가용영역</th><th>연결 등급</th><th>기본 경로</th><th>라우팅 테이블</th><th>남은 IP</th><th>내부 리소스</th></tr></thead>
+            <tbody>
+              {% for row in vpc.subnets %}
+                <tr>
+                  <td><strong>{{ row.label }}</strong><br><code>{{ row.subnet_id }}</code></td>
+                  <td><code>{{ row.cidr }}</code></td>
+                  <td>{{ row.az }}</td>
+                  <td><span class="tier-badge {{ row.tier }}">{{ row.tier_label }}</span></td>
+                  <td><code>{{ row.default_target }}</code></td>
+                  <td>{{ row.route_table_label }}<br><code>{{ row.route_table_id }}</code>{% if not row.route_table_explicit %}<br><span class="severity medium">상속</span>{% endif %}</td>
+                  <td>{{ row.available_ips|number }}</td>
+                  <td>
+                    {% if row.resources %}
+                      <ul class="resource-list">{% for item in row.resources %}<li><span class="service-badge">{{ item.kind_label }}</span> {{ item.label }}</li>{% endfor %}</ul>
+                    {% else %}<span class="muted">없음</span>{% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table></div>
+        </article>
+
+        <article class="card table-card">
+          <div class="card-heading"><div><span>라우팅</span><h2>라우팅 테이블과 연결 서브넷</h2></div><small>{{ vpc.route_tables|length }}개</small></div>
+          <div class="table-scroll"><table>
+            <thead><tr><th>이름</th><th>구분</th><th>연결 서브넷</th><th>라우트</th></tr></thead>
+            <tbody>
+              {% for table in vpc.route_tables %}
+                <tr>
+                  <td><strong>{{ table.label }}</strong><br><code>{{ table.route_table_id }}</code></td>
+                  <td>
+                    {% if table.main %}<span class="severity">메인</span>{% endif %}
+                    {% if table.duplicate_name %}<span class="severity medium">이름 중복</span>{% endif %}
+                    {% if not table.main and not table.duplicate_name %}<span class="muted">-</span>{% endif %}
+                  </td>
+                  <td>{% for label in table.subnet_labels %}{{ label }}{% if not loop.last %}<br>{% endif %}{% else %}<span class="muted">{% if table.main %}없음(미연결 서브넷이 이 테이블을 사용){% else %}없음{% endif %}</span>{% endfor %}</td>
+                  <td><ul class="route-list">{% for row in table.routes %}<li><code>{{ row.destination }}</code> → <code>{{ row.target }}</code></li>{% endfor %}</ul></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table></div>
+        </article>
+
+        <div class="split-grid">
+          <article class="card table-card">
+            <div class="card-heading"><div><span>외부 연결</span><h2>게이트웨이와 피어링</h2></div></div>
+            <div class="table-scroll"><table>
+              <thead><tr><th>종류</th><th>식별자</th><th>내용</th></tr></thead>
+              <tbody>
+                {% for row in vpc.internet_gateways %}<tr><td>인터넷 게이트웨이</td><td><code>{{ row.igw_id }}</code></td><td>{{ row.name or '이름 없음' }}</td></tr>{% endfor %}
+                {% for row in vpc.nat_gateways %}<tr><td>NAT Gateway</td><td><code>{{ row.nat_id }}</code></td><td>{{ row.name or '이름 없음' }} · {{ row.state }} · 공개 IP {{ row.public_ip }} · 위치 <code>{{ row.subnet_id }}</code></td></tr>{% endfor %}
+                {% for row in vpc.peerings %}<tr><td>VPC 피어링</td><td><code>{{ row.peering_id }}</code></td><td>{{ row.name or '이름 없음' }} · {{ row.state }} · 상대 <code>{{ row.peer_vpc_id }}</code> {{ row.peer_cidr }}</td></tr>{% endfor %}
+                {% if not vpc.internet_gateways and not vpc.nat_gateways and not vpc.peerings %}<tr><td colspan="3" class="empty">외부 연결 구성이 없습니다.</td></tr>{% endif %}
+              </tbody>
+            </table></div>
+          </article>
+          <article class="card table-card">
+            <div class="card-heading"><div><span>사설 연결</span><h2>VPC 엔드포인트</h2></div></div>
+            <div class="table-scroll"><table>
+              <thead><tr><th>엔드포인트</th><th>방식</th><th>서비스</th><th>적용 위치</th></tr></thead>
+              <tbody>
+                {% for row in vpc.endpoints %}
+                  <tr><td><code>{{ row.endpoint_id }}</code></td><td>{{ row.type }}</td><td><code>{{ row.service }}</code></td>
+                  <td>{% for item in row.subnet_ids %}<code>{{ item }}</code> {% endfor %}{% for item in row.route_table_ids %}<code>{{ item }}</code> {% endfor %}</td></tr>
+                {% else %}<tr><td colspan="4" class="empty">VPC 엔드포인트가 없습니다.</td></tr>{% endfor %}
+              </tbody>
+            </table></div>
+          </article>
+        </div>
+      {% endif %}
     </section>
 
     <section id="costs" class="tab-panel" role="tabpanel" hidden>
@@ -270,6 +426,7 @@
         <li><strong>비용</strong> Cost Explorer 월별 실제 사용 비용과 Cost Anomaly Detection 급증 신호</li>
         <li><strong>절감 추천</strong> Cost Optimization Hub가 활성화된 경우의 AWS 추천</li>
         <li><strong>운영 문제</strong> ALARM 상태 CloudWatch 경보와 EC2 인스턴스·시스템 상태</li>
+        <li><strong>네트워크 토폴로지</strong> VPC·서브넷·라우팅 테이블·게이트웨이·피어링·엔드포인트 조회. 서브넷 안의 리소스는 네트워크 인터페이스에서 역추적하므로, 인터페이스를 만들지 않는 리소스는 나타나지 않습니다.</li>
       </ul>
       {% if data.errors %}<h3>조회하지 못한 항목</h3><div class="table-scroll"><table><thead><tr><th>영역</th><th>오류</th></tr></thead><tbody>{% for row in data.errors %}<tr><td>{{ row.section }}</td><td>{{ row.error }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
     </details>
